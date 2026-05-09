@@ -107,6 +107,258 @@ Trong đó:
 
 Nhãn hiện tại dùng cho train/baseline là `profile-level NoC`.
 
+## Mô tả chi tiết định dạng dữ liệu
+
+Phần này mô tả đúng định dạng dữ liệu mà repo đang đọc và cách nó được biến đổi thành tensor đầu vào cho mô hình.
+
+### 1. Dữ liệu đầu vào thô
+
+Loader hiện hỗ trợ:
+
+- `.csv`
+- `.xlsx`
+- `.xls`
+
+Các file GeneMapper thường ở dạng wide table, nghĩa là một dòng có thể chứa nhiều peak của cùng một marker thông qua các cột lặp lại như:
+
+- `Allele 1`, `Allele 2`, ...
+- `Size 1`, `Size 2`, ...
+- `Height 1`, `Height 2`, ...
+
+Ngoài ra loader còn tìm các cột định danh chính:
+
+- cột sample: một trong `Sample Name`, `SampleName`, `Sample File`, `Sample`
+- cột locus/marker: một trong `Marker`, `Locus`, `marker`, `locus`
+- cột dye: một trong `Dye`, `dye`, `Color`, `Dye Color`
+
+Nếu không tìm thấy cột sample hoặc marker, loader sẽ báo lỗi và bỏ qua file đó.
+
+### 2. Chuẩn hóa về long format
+
+Trong [src/data_loader.py](/home/nguyenquocdung/work/deepNoC/src/data_loader.py), dữ liệu wide format được chuyển về long format với mỗi dòng tương ứng một peak hợp lệ. DataFrame trung gian sau chuẩn hóa có các cột:
+
+- `SampleName`
+- `Marker`
+- `Dye`
+- `Allele`
+- `Size`
+- `Height`
+
+Các peak bị loại ở bước này gồm:
+
+- peak không có allele,
+- peak có `Height <= 0`,
+- allele không parse được,
+- allele `OL` (off-ladder),
+- locus không thuộc bộ 24 locus của GlobalFiler.
+
+Riêng `AMEL`, allele ký tự được ánh xạ như sau:
+
+- `X -> 1.0`
+- `Y -> 2.0`
+
+### 3. Bộ locus được sử dụng
+
+Repo hiện cố định đúng `24` locus của GlobalFiler theo thứ tự sau:
+
+```text
+D3S1358, vWA, D16S539, CSF1PO, TPOX,
+Y-Indel, AMEL, D8S1179, D21S11, D18S51,
+DYS391, D2S441, D19S433, TH01, FGA,
+D22S1045, D5S818, D13S317, D7S820, SE33,
+D10S1248, D1S1656, D12S391, D2S1338
+```
+
+Thứ tự này quan trọng vì nó được dùng trực tiếp cho:
+
+- one-hot encoding của locus,
+- trục đầu tiên của tensor đầu vào `[24, 50, 89]`.
+
+Một số alias được map về tên chuẩn, ví dụ:
+
+- `Yindel` hoặc `Y Indel` -> `Y-Indel`
+- `VWA` -> `vWA`
+- `Amelogenin` -> `AMEL`
+
+### 4. Cách suy ra nhãn NoC
+
+Nhãn `y` hiện tại là số contributor ở cấp profile.
+
+Loader suy ra `NoC` theo thứ tự ưu tiên:
+
+1. từ tên file, ví dụ `_1P.csv`, `_2P.csv`, `_3P.csv`
+2. nếu là file multi-person kiểu `_2-5P.csv`, parse từ sample name
+
+Repo hiện đã hỗ trợ đúng sample name PROVEDIt dạng:
+
+- `...-1;1-...` -> `NoC = 2`
+- `...-1;2;1-...` -> `NoC = 3`
+- `...-1;1;1;1-...` -> `NoC = 4`
+- `...-1;1;1;1;1-...` -> `NoC = 5`
+
+Ngoài ra vẫn giữ fallback cho các pattern cũ như:
+
+- `1to1`
+- `1to1to1`
+- `2p`, `3p`, `4p`, `5p`
+
+Nếu không suy ra được `NoC`, sample sẽ bị bỏ qua.
+
+### 5. Tensor đầu ra cho mỗi profile
+
+Mỗi profile sau xử lý được biểu diễn thành tensor:
+
+```text
+[24, 50, 89]
+```
+
+Ý nghĩa từng chiều:
+
+- `24`: số locus cố định của GlobalFiler
+- `50`: số peak tối đa mỗi locus
+- `89`: số đặc trưng cho mỗi peak
+
+Nếu một locus có ít hơn 50 peak thì phần còn lại được zero-pad.
+
+Nếu một locus có nhiều hơn 50 peak thì chỉ giữ tối đa 50 peak đầu sau khi sắp xếp.
+
+Toàn bộ dataset sau `prepare` có dạng:
+
+- `X`: `[N, 24, 50, 89]`
+- `y`: `[N]`
+
+### 6. Cấu trúc 89 đặc trưng mỗi peak
+
+Các feature được xây trong `build_peak_features()` và `build_profile_tensor()`.
+
+#### Nhóm 1: Định danh locus và peak cơ bản
+
+- `1-24`: one-hot locus
+- `25`: allele đã chuẩn hóa bằng `ALLELE_NORM = 100`
+- `26`: size đã chuẩn hóa bằng `SIZE_NORM = 100`
+- `27`: height đã chuẩn hóa bằng `HEIGHT_NORM = 33000`
+- `28`: allele frequency
+- `29`: peak label probability
+
+Trong code, chỉ số mảng Python tương ứng là:
+
+- `0:24` cho one-hot locus
+- `24` cho allele
+- `25` cho size
+- `26` cho height
+- `27` cho allele frequency
+- `28` cho peak label probability
+
+#### Nhóm 2: Thông tin stutter
+
+Feature `30-77` mã hóa quan hệ stutter cho 4 loại:
+
+- back stutter
+- double-back stutter
+- forward stutter
+- 0.2-repeat stutter
+
+Mỗi loại có 2 hướng thông tin:
+
+- peak hiện tại là stutter của một peak cha
+- peak hiện tại là peak cha của một stutter
+
+Với mỗi hướng, code lưu các giá trị như:
+
+- allele liên quan,
+- height liên quan,
+- tỉ lệ chiều cao,
+- expected stutter ratio,
+- allele frequency,
+- peak label probability.
+
+Tổng cộng phần này chiếm `48` feature.
+
+#### Nhóm 3: Đặc trưng mức locus và mức profile
+
+- `78`: tổng số peak tại locus, chuẩn hóa theo `LOCUS_PEAK_NORM = 100`
+- `79`: tổng số peak trong profile, chuẩn hóa theo `PROFILE_PEAK_NORM = 1000`
+- `80-89`: estimated mixture proportions cho tối đa 10 contributor
+
+### 7. Cách ước lượng peak label probability
+
+Repo hiện chưa có MHCNN như paper gốc, nên `peak label probability` đang là heuristic:
+
+- peak càng cao so với peak lớn nhất trong locus thì xác suất càng cao,
+- peak nằm ở vị trí có khả năng là stutter thì bị giảm xác suất.
+
+Giá trị này được chặn trong khoảng:
+
+```text
+[0.01, 0.99]
+```
+
+Nghĩa là đây là feature xấp xỉ để pipeline chạy được, chưa phải bản tái hiện chính xác hoàn toàn từ paper.
+
+### 8. Cách ước lượng mixture proportions
+
+Feature `80-89` hiện được tạo từ hàm `estimate_smart_start()`, là một bản đơn giản hóa ý tưởng `smart start`.
+
+Logic hiện tại:
+
+- gom tất cả peak height trong profile,
+- sắp giảm dần,
+- chia thành các cụm thô để ước lượng tỷ lệ contributor,
+- chuẩn hóa để tổng bằng `1`,
+- sắp xếp contributor lớn nhất trước.
+
+Vì vậy phần mixture proportion hiện nên được hiểu là feature hỗ trợ mang tính heuristic, không phải ground-truth contributor proportion.
+
+### 9. Tên sample lưu sau khi prepare
+
+Ngoài `X` và `y`, pipeline còn lưu `sample_names.txt`.
+
+Mỗi dòng có format:
+
+```text
+<file_stem>:<sample_name>
+```
+
+Ví dụ:
+
+```text
+RD14-0003_GF_25sec_GM_SE33F_2-5P:A02_RD14-0003-31_32-1;1-M2c-0.03GF-Q2.0_01.25sec.hid
+```
+
+File này hữu ích để:
+
+- truy vết profile gốc,
+- debug sample bị dự đoán sai,
+- đối chiếu tensor với file nguồn.
+
+### 10. Tóm tắt luồng biến đổi dữ liệu
+
+Luồng xử lý hiện tại có thể tóm tắt như sau:
+
+```text
+GeneMapper CSV/XLSX
+-> chọn file đúng filter (3500, GF, 25sec)
+-> đọc wide table
+-> chuyển thành peak-level long table
+-> chuẩn hóa tên locus
+-> parse NoC từ filename / sample name
+-> gom peak theo sample
+-> build tensor [24, 50, 89]
+-> lưu X_gf25.npy, y_gf25.npy, sample_names.txt
+```
+
+### 11. Những giới hạn cần biết khi đọc dữ liệu
+
+Phần dữ liệu hiện tại có vài giới hạn quan trọng:
+
+- allele frequency đang dùng giá trị mặc định xấp xỉ, chưa phải bảng allele frequency đầy đủ,
+- peak label probability là heuristic,
+- mixture proportion là ước lượng đơn giản hóa,
+- label huấn luyện hiện tại tập trung vào `profile-level NoC`,
+- chưa có pipeline sinh toàn bộ label phụ ở mức peak/locus như bản đầy đủ của paper.
+
+Vì vậy, phần định dạng dữ liệu hiện tại phù hợp để chạy baseline, train thử và phân tích mô hình `NoC`, nhưng chưa nên coi là bản tái hiện hoàn chỉnh toàn bộ pipeline dữ liệu của bài báo.
+
 ## Cách chạy
 
 ### 1. Chuẩn bị dữ liệu

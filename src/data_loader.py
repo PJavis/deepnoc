@@ -497,6 +497,7 @@ def load_provedit_dataset(data_dir: str,
                            kit_filter: str = "GF",
                            injection_filter: str = "25sec",
                            instrument_filter: str = "3500",
+                           max_1person: int = 70,
                            verbose: bool = True) -> tuple:
     """
     Load and process PROVEDIt dataset from filtered CSV files.
@@ -516,91 +517,86 @@ def load_provedit_dataset(data_dir: str,
     # Find matching subdirectory
     base_dir = Path(data_dir)
     target_dirs = list(base_dir.glob(f"*{instrument_filter}*{kit_filter}*"))
-    
     if not target_dirs:
-        # Try broader search
         target_dirs = list(base_dir.glob("*"))
         target_dirs = [d for d in target_dirs if d.is_dir() 
                        and instrument_filter in d.name and kit_filter in d.name]
     
     if not target_dirs:
-        raise FileNotFoundError(
-            f"No matching directory found in {data_dir} for "
-            f"instrument={instrument_filter}, kit={kit_filter}"
-        )
+        raise FileNotFoundError(f"No matching directory for {instrument_filter} + {kit_filter}")
     
     target_dir = target_dirs[0]
     if verbose:
         print(f"Loading from: {target_dir}")
-    
-    # Find all CSV/XLSX files with matching injection time
+
+    # Tìm tất cả file CSV/XLSX có injection_filter
     data_files = []
     for ext in ['*.csv', '*.xlsx']:
         data_files.extend(target_dir.rglob(ext))
     
-    # Filter for injection time and exclude known genotype files
     data_files = [
         f for f in data_files
         if injection_filter in f.name
         and 'Known Genotype' not in f.name
         and 'Genotype' not in f.name
-        and not f.name.startswith('~$')  # Skip temp files
+        and not f.name.startswith('~$')
     ]
-    
+
     if verbose:
         print(f"Found {len(data_files)} data files")
-    
+
     all_X = []
     all_y = []
     all_names = []
-    
+    one_person_count = 0
+
     for fpath in sorted(data_files):
         if verbose:
             print(f"  Processing: {fpath.name}")
-        
+
         try:
             df = read_genemapper_csv(str(fpath))
         except Exception as e:
             print(f"  WARNING: Failed to read {fpath.name}: {e}")
             continue
-        
+
         if len(df) == 0:
-            print(f"  WARNING: No valid peaks in {fpath.name}")
             continue
-        
-        # Get unique samples in this file
+
         samples = df['SampleName'].unique()
-        
+
         for sample in samples:
             sample_peaks = df[df['SampleName'] == sample].copy()
             
-            # Determine NoC
             noc = parse_noc_from_sample_name(sample, str(fpath))
-            if noc < 1 or noc > MAX_NOC:
-                if verbose:
-                    print(f"    Skipping sample '{sample}': unknown NoC")
+            if noc < 1 or noc > 5:
                 continue
-            
+
+            # === GIỚI HẠN SINGLE-SOURCE ===
+            if noc == 1:
+                if one_person_count >= max_1person:
+                    continue  # Bỏ qua các single-source thừa
+                one_person_count += 1
+
             total_peaks = len(sample_peaks)
-            
-            # Build tensor
             tensor = build_profile_tensor(sample_peaks, total_peaks)
-            
+
             all_X.append(tensor)
             all_y.append(noc)
             all_names.append(f"{fpath.stem}:{sample}")
-    
+
     if len(all_X) == 0:
-        raise ValueError("No profiles loaded! Check data directory and filters.")
-    
+        raise ValueError("No profiles loaded!")
+
     X = np.stack(all_X)
     y = np.array(all_y, dtype=np.int64)
-    
+
     if verbose:
-        print(f"\nLoaded {len(X)} profiles")
+        print(f"\nLoaded {len(X)} profiles (max_1person={max_1person})")
         for noc in sorted(np.unique(y)):
-            print(f"  NoC={noc}: {np.sum(y == noc)} profiles")
-    
+            count = np.sum(y == noc)
+            print(f"  NoC={noc}: {count} profiles")
+
     return X, y, all_names
 
 

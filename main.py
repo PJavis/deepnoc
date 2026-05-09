@@ -97,32 +97,82 @@ def cmd_baseline(args):
     print(f"{'='*40}")
 
 
-def cmd_train(args):
-    """Train deepNoC model."""
+def _split(X, y, names, args):
+    """Choose the split strategy based on `--split`."""
+    strategy = getattr(args, "split", "alternating")
+    if strategy == "stratified":
+        from src.split import stratified_split
+        return stratified_split(X, y, names, test_size=args.test_size, seed=args.seed)
+    if strategy == "grouped":
+        from src.split import grouped_stratified_split
+        return grouped_stratified_split(X, y, names, test_size=args.test_size,
+                                        seed=args.seed)
     from src.data_loader import train_test_split_alternating
-    from models.deepnoc.train import train_deepnoc
+    return train_test_split_alternating(X, y, names)
+
+
+def _load_names(args):
+    path = os.path.join(args.output_dir, "sample_names.txt")
+    if os.path.exists(path):
+        with open(path) as f:
+            return [line.rstrip("\n") for line in f if line.strip()]
+    return None
+
+
+def cmd_train(args):
+    """Train deepNoC or NoCFormer model."""
     from src.evaluation import full_evaluation, plot_training_history
-    
+
     print("=" * 60)
-    print(f"  Stage 3: Training deepNoC ({args.model})")
+    print(f"  Stage 3: Training {args.model}")
     print("=" * 60)
-    
-    # Load data
+
     X, y = load_data(args)
-    
-    # Split
-    X_train, X_test, y_train, y_test, _, _ = train_test_split_alternating(
-        X, y, list(range(len(y)))
-    )
-    
-    # Determine number of classes
+    names = _load_names(args) or [str(i) for i in range(len(y))]
+    if len(names) != len(y):
+        names = [str(i) for i in range(len(y))]
+    X_train, X_test, y_train, y_test, _, _ = _split(X, y, names, args)
+
     num_classes = int(y.max())
-    print(f"Classes: {num_classes} (1 to {num_classes})")
-    
-    # Device
+    print(f"Classes: {num_classes} (1 to {num_classes})  "
+          f"split={getattr(args, 'split', 'alternating')}")
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Train
+
+    if args.model == "nocformer":
+        from models.nocformer.train import train_nocformer, predict_with_tta
+        model, history = train_nocformer(
+            X_train, y_train, X_test, y_test,
+            num_classes=num_classes,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            peak_layers=args.peak_layers,
+            locus_layers=args.locus_layers,
+            dropout=args.dropout,
+            augment=not args.no_augment,
+            device=device,
+            save_dir=args.results_dir,
+            tag="nocformer",
+        )
+        plot_training_history(
+            history, title="NoCFormer",
+            save_path=os.path.join(args.results_dir, "training_history_nocformer.png"),
+        )
+        print("\n--- Final TTA Evaluation on Test Set ---")
+        probs, entropy, preds = predict_with_tta(
+            model, X_test, n_samples=args.tta_samples, device=device,
+        )
+        labels = sorted(set(y_test))
+        full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
+                        title="NoCFormer", save_dir=args.results_dir)
+        np.save(os.path.join(args.results_dir, "nocformer_test_entropy.npy"), entropy)
+        return
+
+    # Original deepNoC paths
+    from models.deepnoc.train import train_deepnoc
     model, history = train_deepnoc(
         X_train, y_train, X_test, y_test,
         num_classes=num_classes,
@@ -134,28 +184,21 @@ def cmd_train(args):
         save_dir=args.results_dir,
         model_type=args.model,
     )
-    
-    # Plot training history
     plot_training_history(
         history, title=f"deepNoC ({args.model})",
         save_path=os.path.join(args.results_dir, f'training_history_{args.model}.png'),
     )
-    
-    # Final evaluation
     print("\n--- Final Evaluation on Test Set ---")
     model.eval()
     with torch.no_grad():
         X_test_t = torch.FloatTensor(X_test).to(device)
-        
         if args.model == "full":
             outputs = model(X_test_t)
             logits = outputs['profile_noc']
         else:
             logits = model(X_test_t)
-        
         probs = torch.softmax(logits, dim=-1).cpu().numpy()
-        preds = probs.argmax(axis=1) + 1  # 1-indexed
-    
+        preds = probs.argmax(axis=1) + 1
     labels = sorted(set(y_test))
     full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
                     title=f"deepNoC_{args.model}", save_dir=args.results_dir)
@@ -264,17 +307,33 @@ def main():
     
     # Train command
     p_train = subparsers.add_parser('train', parents=[common],
-                                     help='Train deepNoC')
-    p_train.add_argument('--model', choices=['full', 'simple'], default='simple',
-                         help='Model type: full (multi-output) or simple')
-    p_train.add_argument('--epochs', type=int, default=2000,
+                                     help='Train deepNoC or NoCFormer')
+    p_train.add_argument('--model', choices=['full', 'simple', 'nocformer'],
+                         default='nocformer',
+                         help='Model: full / simple (deepNoC) or nocformer')
+    p_train.add_argument('--epochs', type=int, default=200,
                          help='Number of training epochs')
-    p_train.add_argument('--batch-size', type=int, default=100,
+    p_train.add_argument('--batch-size', type=int, default=32,
                          help='Batch size')
-    p_train.add_argument('--lr', type=float, default=1e-5,
+    p_train.add_argument('--lr', type=float, default=3e-4,
                          help='Learning rate')
     p_train.add_argument('--beta1', type=float, default=0.5,
-                         help='Adam beta1 parameter')
+                         help='Adam beta1 parameter (deepNoC only)')
+    p_train.add_argument('--split', choices=['alternating', 'stratified', 'grouped'],
+                         default='grouped',
+                         help='Train/test split strategy')
+    p_train.add_argument('--test-size', type=float, default=0.25)
+    p_train.add_argument('--seed', type=int, default=42)
+    # NoCFormer-only knobs
+    p_train.add_argument('--d-model', type=int, default=128)
+    p_train.add_argument('--n-heads', type=int, default=4)
+    p_train.add_argument('--peak-layers', type=int, default=2)
+    p_train.add_argument('--locus-layers', type=int, default=4)
+    p_train.add_argument('--dropout', type=float, default=0.15)
+    p_train.add_argument('--no-augment', action='store_true',
+                         help='Disable synthetic-mixture augmentation')
+    p_train.add_argument('--tta-samples', type=int, default=20,
+                         help='MC-Dropout / TTA samples at evaluation time')
     
     # Evaluate command
     p_eval = subparsers.add_parser('evaluate', parents=[common],

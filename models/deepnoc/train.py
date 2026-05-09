@@ -51,23 +51,7 @@ def train_deepnoc(X_train, y_train, X_test, y_test,
                    model_type="full",
                    verbose=True):
     """
-    Train deepNoC model.
-    
-    Args:
-        X_train, y_train: training data [N, 24, 50, 89] and labels [N]
-        X_test, y_test: test data
-        num_classes: number of NoC classes (5 for PROVEDIt, 10 for simulated)
-        epochs: number of training epochs
-        batch_size: batch size
-        lr: learning rate
-        beta1: Adam beta1 parameter
-        device: torch device
-        save_dir: directory to save results
-        model_type: "full" for DeepNoC, "simple" for DeepNoCSimple
-        verbose: print progress
-    
-    Returns:
-        model, history dict
+    Train deepNoC model - Đã sửa lỗi ReduceLROnPlateau
     """
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -76,7 +60,7 @@ def train_deepnoc(X_train, y_train, X_test, y_test,
         print(f"Training on: {device}")
         if device.type == 'cuda':
             print(f"  GPU: {torch.cuda.get_device_name(0)}")
-            print(f"  VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+            print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
     os.makedirs(save_dir, exist_ok=True)
     
@@ -99,19 +83,23 @@ def train_deepnoc(X_train, y_train, X_test, y_test,
         print(f"Training: {len(X_train)} profiles, Testing: {len(X_test)} profiles")
         print(f"Classes: {num_classes}, Epochs: {epochs}, LR: {lr}")
     
-    # Optimizer (matching paper: Adam, lr=1e-5, beta1=0.5)
+    # Optimizer (matching paper)
     optimizer = optim.Adam(model.parameters(), lr=lr, betas=(beta1, 0.999))
     
-    # Learning rate scheduler (reduce on plateau)
+    # Learning rate scheduler - SỬA LỖI Ở ĐÂY
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=100, verbose=verbose
+        optimizer, 
+        mode='max', 
+        factor=0.5, 
+        patience=100,
+        # verbose đã bị loại bỏ → thay bằng logger thủ công
     )
     
     # Training history
     history = {
         'train_loss': [], 'test_loss': [],
         'train_acc': [], 'test_acc': [],
-        'best_test_acc': 0, 'best_epoch': 0,
+        'best_test_acc': 0.0, 'best_epoch': 0,
     }
     
     best_acc = 0.0
@@ -123,7 +111,7 @@ def train_deepnoc(X_train, y_train, X_test, y_test,
         train_correct = 0
         train_total = 0
         
-        for batch_X, batch_y in train_loader:
+        for batch_X, batch_y in tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not verbose):
             batch_X = batch_X.to(device)
             batch_y = batch_y.to(device)
             
@@ -204,46 +192,24 @@ def train_deepnoc(X_train, y_train, X_test, y_test,
         # Print progress
         if verbose and (epoch % 50 == 0 or epoch == epochs - 1):
             print(f"Epoch {epoch:4d}/{epochs} | "
-                  f"Train Loss: {train_loss:.4f} Acc: {train_acc:.3f} | "
-                  f"Test Loss: {test_loss:.4f} Acc: {test_acc:.3f} | "
-                  f"Best: {best_acc:.3f} (ep {history['best_epoch']})")
+                  f"Train Acc: {train_acc:.3f} | Test Acc: {test_acc:.3f} | "
+                  f"Best Test Acc: {best_acc:.3f} (ep {history['best_epoch']})")
         
         # Early save every 200 epochs
         if (epoch + 1) % 200 == 0:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
                 'test_acc': test_acc,
             }, os.path.join(save_dir, f'checkpoint_{model_type}_ep{epoch+1}.pt'))
     
     # Save final history
     with open(os.path.join(save_dir, f'history_{model_type}.json'), 'w') as f:
-        json.dump({k: v if not isinstance(v, list) else [float(x) for x in v]
+        json.dump({k: [float(x) if isinstance(x, (int,float)) else x 
+                      for x in v] if isinstance(v, list) else v 
                    for k, v in history.items()}, f, indent=2)
     
     if verbose:
-        print(f"\nTraining complete. Best test accuracy: {best_acc:.4f} at epoch {history['best_epoch']}")
+        print(f"\nTraining completed! Best test accuracy: {best_acc:.4f} at epoch {history['best_epoch']}")
     
     return model, history
-
-
-def load_model(checkpoint_path, device=None, num_classes=5, model_type="full"):
-    """Load a saved model from checkpoint."""
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
-    nc = checkpoint.get('num_classes', num_classes)
-    mt = checkpoint.get('model_type', model_type)
-    
-    if mt == "full":
-        model = DeepNoC(num_classes=nc).to(device)
-    else:
-        model = DeepNoCSimple(num_classes=nc).to(device)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    return model
