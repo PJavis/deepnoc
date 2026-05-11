@@ -191,6 +191,27 @@ def random_peak_dropout(profile: torch.Tensor, p: float = 0.05) -> torch.Tensor:
     return _recompute_global_features(out)
 
 
+def random_noise_peaks(profile: torch.Tensor, n: int = 2,
+                       height_scale: float = 0.05) -> torch.Tensor:
+    """Inject a few low-intensity noise peaks at empty locus slots."""
+    out = profile.clone()
+    for li in range(NUM_LOCI):
+        block = out[li]
+        mask = block[:, HEIGHT_IDX] > 0
+        empty = (~mask).nonzero(as_tuple=False).squeeze(-1)
+        if empty.numel() == 0:
+            continue
+        n_insert = min(int(n), int(empty.numel()))
+        if n_insert == 0:
+            continue
+        chosen = empty[torch.randperm(empty.numel())[:n_insert]]
+        for idx in chosen:
+            out[li, idx, ALLELE_IDX] = 0.0
+            out[li, idx, SIZE_IDX] = 0.0
+            out[li, idx, HEIGHT_IDX] = float(torch.rand(1).item()) * height_scale
+    return _recompute_global_features(out)
+
+
 def shuffle_peak_axis(profile: torch.Tensor) -> torch.Tensor:
     """
     Randomly permute peaks within each locus. Safe because the model is
@@ -219,6 +240,9 @@ class AugmentConfig:
     jitter_sigma: float = 0.12
     p_dropout: float = 0.5
     dropout_rate: float = 0.03
+    p_noise: float = 0.30
+    noise_peaks: int = 2
+    noise_height_scale: float = 0.05
     shuffle_peaks: bool = True
 
 
@@ -268,6 +292,9 @@ class TrainingAugmenter:
                 x = peak_height_jitter(x, sigma=self.cfg.jitter_sigma)
             if self.cfg.p_dropout > 0 and torch.rand(()).item() < self.cfg.p_dropout:
                 x = random_peak_dropout(x, p=self.cfg.dropout_rate)
+            if self.cfg.p_noise > 0 and torch.rand(()).item() < self.cfg.p_noise:
+                x = random_noise_peaks(x, n=self.cfg.noise_peaks,
+                                      height_scale=self.cfg.noise_height_scale)
             if self.cfg.shuffle_peaks:
                 x = shuffle_peak_axis(x)
             if mix is None:

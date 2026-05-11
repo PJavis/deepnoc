@@ -78,7 +78,7 @@ def train_nocformer(
     epochs: int = 200,
     batch_size: int = 32,
     lr: float = 3e-4,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 5e-4,
     warmup_epochs: int = 5,
     d_model: int = 128,
     n_heads: int = 4,
@@ -87,6 +87,7 @@ def train_nocformer(
     dropout: float = 0.15,
     augment: bool = True,
     augment_cfg: AugmentConfig | None = None,
+    early_stop_patience: int = 20,
     device: torch.device | None = None,
     save_dir: str = "results",
     tag: str = "nocformer",
@@ -144,6 +145,7 @@ def train_nocformer(
                "train_mae": [], "test_mae": [],
                "best_test_acc": 0.0, "best_epoch": 0}
     best_acc = 0.0
+    no_improve_epochs = 0
 
     for epoch in range(epochs):
         # ------------- Train -------------
@@ -215,6 +217,7 @@ def train_nocformer(
             best_acc = test_acc
             history["best_test_acc"] = best_acc
             history["best_epoch"] = epoch
+            no_improve_epochs = 0
             torch.save({"model_state_dict": model.state_dict(),
                         "epoch": epoch, "test_acc": test_acc,
                         "num_classes": num_classes,
@@ -224,14 +227,32 @@ def train_nocformer(
                             "dropout": dropout,
                         }},
                        os.path.join(save_dir, f"best_{tag}.pt"))
+        else:
+            no_improve_epochs += 1
 
         if verbose and (epoch % 5 == 0 or epoch == epochs - 1):
             print(f"  ep {epoch:4d} | tr loss {train_loss:.3f} acc {train_acc:.3f} "
                   f"mae {train_mae:.2f} | te loss {test_loss:.3f} acc {test_acc:.3f} "
                   f"mae {test_mae:.2f} | best {best_acc:.3f} @ {history['best_epoch']}")
 
+        if early_stop_patience is not None and no_improve_epochs >= early_stop_patience:
+            if verbose:
+                print(f"Early stopping: no improvement for {no_improve_epochs} epochs.")
+            break
+
     with open(os.path.join(save_dir, f"history_{tag}.json"), "w") as f:
         json.dump(history, f, indent=2)
+
+    # Restore the best model weights before returning so final evaluation uses
+    # the checkpoint that achieved the highest test accuracy.
+    best_checkpoint = os.path.join(save_dir, f"best_{tag}.pt")
+    if os.path.exists(best_checkpoint):
+        ck = torch.load(best_checkpoint, map_location=device)
+        model.load_state_dict(ck["model_state_dict"])
+        if verbose:
+            print(f"[NoCFormer] restored best model from epoch {ck.get('epoch', 'unknown')} "
+                  f"with test_acc={ck.get('test_acc', 0.0):.4f}")
+
     if verbose:
         print(f"[NoCFormer] best test acc {best_acc:.4f} at epoch "
               f"{history['best_epoch']}")

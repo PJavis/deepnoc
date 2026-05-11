@@ -147,12 +147,14 @@ def cmd_train(args):
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
+            weight_decay=args.weight_decay,
             d_model=args.d_model,
             n_heads=args.n_heads,
             peak_layers=args.peak_layers,
             locus_layers=args.locus_layers,
             dropout=args.dropout,
             augment=not args.no_augment,
+            early_stop_patience=args.early_stop_patience,
             device=device,
             save_dir=args.results_dir,
             tag="nocformer",
@@ -161,14 +163,25 @@ def cmd_train(args):
             history, title="NoCFormer",
             save_path=os.path.join(args.results_dir, "training_history_nocformer.png"),
         )
-        print("\n--- Final TTA Evaluation on Test Set ---")
-        probs, entropy, preds = predict_with_tta(
-            model, X_test, n_samples=args.tta_samples, device=device,
-        )
-        labels = sorted(set(y_test))
-        full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
-                        title="NoCFormer", save_dir=args.results_dir)
-        np.save(os.path.join(args.results_dir, "nocformer_test_entropy.npy"), entropy)
+        if args.no_tta:
+            print("\n--- Final deterministic evaluation on Test Set ---")
+            labels = sorted(set(y_test))
+            with torch.no_grad():
+                X_test_t = torch.FloatTensor(X_test).to(device)
+                outputs = model(X_test_t)
+                probs = outputs['profile_noc_probs'].cpu().numpy()
+                preds = probs.argmax(axis=1) + 1
+            full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
+                            title="NoCFormer", save_dir=args.results_dir)
+        else:
+            print("\n--- Final TTA Evaluation on Test Set ---")
+            probs, entropy, preds = predict_with_tta(
+                model, X_test, n_samples=args.tta_samples, device=device,
+            )
+            labels = sorted(set(y_test))
+            full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
+                            title="NoCFormer", save_dir=args.results_dir)
+            np.save(os.path.join(args.results_dir, "nocformer_test_entropy.npy"), entropy)
         return
 
     # Original deepNoC paths
@@ -330,8 +343,14 @@ def main():
     p_train.add_argument('--peak-layers', type=int, default=2)
     p_train.add_argument('--locus-layers', type=int, default=4)
     p_train.add_argument('--dropout', type=float, default=0.15)
+    p_train.add_argument('--weight-decay', type=float, default=5e-4,
+                         help='Weight decay for NoCFormer AdamW')
+    p_train.add_argument('--early-stop-patience', type=int, default=20,
+                         help='Stop training if test does not improve for this many epochs')
     p_train.add_argument('--no-augment', action='store_true',
                          help='Disable synthetic-mixture augmentation')
+    p_train.add_argument('--no-tta', action='store_true',
+                         help='Disable TTA evaluation and use deterministic predictions')
     p_train.add_argument('--tta-samples', type=int, default=20,
                          help='MC-Dropout / TTA samples at evaluation time')
     

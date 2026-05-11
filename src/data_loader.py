@@ -514,30 +514,54 @@ def load_provedit_dataset(data_dir: str,
         y: array of shape [N] (NoC labels, 1-indexed)
         sample_names: list of sample identifiers
     """
-    # Find matching subdirectory
+    # Find matching subdirectories under the provided data_dir.
     base_dir = Path(data_dir)
-    target_dirs = list(base_dir.glob(f"*{instrument_filter}*{kit_filter}*"))
-    if not target_dirs:
-        target_dirs = list(base_dir.glob("*"))
-        target_dirs = [d for d in target_dirs if d.is_dir() 
-                       and instrument_filter in d.name and kit_filter in d.name]
-    
-    if not target_dirs:
-        raise FileNotFoundError(f"No matching directory for {instrument_filter} + {kit_filter}")
-    
-    target_dir = target_dirs[0]
-    if verbose:
-        print(f"Loading from: {target_dir}")
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Data directory does not exist: {base_dir}")
 
-    # Tìm tất cả file CSV/XLSX có injection_filter
+    def _matches_filter(value: str, pattern: str) -> bool:
+        if not pattern or pattern.lower() == 'all':
+            return True
+        return pattern in value
+
+    target_dirs = []
+    if base_dir.is_dir():
+        for child in sorted(base_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            if (_matches_filter(child.name, instrument_filter)
+                    and _matches_filter(child.name, kit_filter)):
+                target_dirs.append(child)
+
+    # If the base directory itself contains data files, use it as a target too.
+    if not target_dirs:
+        has_files = any(base_dir.rglob('*.csv')) or any(base_dir.rglob('*.xlsx'))
+        if has_files:
+            target_dirs = [base_dir]
+
+    if not target_dirs:
+        raise FileNotFoundError(
+            f"No matching directory for instrument={instrument_filter} kit={kit_filter}"
+        )
+
+    if verbose:
+        print(f"Loading from {len(target_dirs)} directory(ies):")
+        for d in target_dirs:
+            print(f"  {d}")
+
+    # Collect all matching CSV/XLSX files in the selected directories.
     data_files = []
-    for ext in ['*.csv', '*.xlsx']:
-        data_files.extend(target_dir.rglob(ext))
-    
+    for target_dir in target_dirs:
+        for ext in ['*.csv', '*.xlsx']:
+            data_files.extend(target_dir.rglob(ext))
+
+    data_files = sorted(set(data_files))
+    if injection_filter and injection_filter.lower() != 'all':
+        data_files = [f for f in data_files if injection_filter.lower() in f.name.lower()]
+
     data_files = [
         f for f in data_files
-        if injection_filter in f.name
-        and 'Known Genotype' not in f.name
+        if 'Known Genotype' not in f.name
         and 'Genotype' not in f.name
         and not f.name.startswith('~$')
     ]
