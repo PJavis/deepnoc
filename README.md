@@ -4,10 +4,64 @@ Repo này là bản triển khai thực nghiệm cho bài toán dự đoán số
 
 - chuẩn bị dữ liệu PROVEDIt từ GeneMapper CSV/XLSX,
 - chạy baseline `MAC` và `Random Forest`,
-- huấn luyện model `simple` hoặc `full`,
-- đánh giá bằng confusion matrix, accuracy, precision, recall, F1 và threshold analysis.
+- huấn luyện model `simple` / `full` (deepNoC CNN), `nocformer`, hoặc `nocnet_v2`,
+- sinh dữ liệu hỗn hợp tổng hợp (synthetic mixtures) từ pool NoC=1,
+- fine-tune trên dữ liệu thật sau khi pretrain trên synthetic,
+- chạy 5-fold grouped cross-validation để so sánh các model trên cùng split,
+- đánh giá bằng confusion matrix, accuracy, MAE, off-by-one acc, macro-F1.
 
 README này mô tả đúng những gì repo đang chạy được bây giờ, không phải kế hoạch dài hạn ban đầu.
+
+## Model nào nên dùng?
+
+Đang có 4 nhánh model. Khuyến nghị:
+
+- `nocnet_v2` — **mặc định mới**. Deep Sets + stutter-aware attention + count-aware multi-head. Train trên dữ liệu synthetic rồi fine-tune trên PROVEDIt thật.
+- `nocformer` — bản hierarchical Transformer cũ. Overfit trên dữ liệu PROVEDIt nhỏ; chỉ giữ để so sánh.
+- `simple` / `full` — deepNoC CNN gốc theo paper. Vẫn chạy được nhưng số liệu trong các README/checkpoint cũ tính trên split `alternating` (bị leak replicate), nên không phải số honest. So sánh fair phải dùng split `grouped`.
+
+## Pipeline đề xuất cho NoCNet-v2
+
+Bốn bước, có thể chạy tuần tự bằng `main.py`:
+
+```bash
+# 1. Chuẩn bị dữ liệu PROVEDIt -> .npy
+python main.py prepare --data-dir "data/provedit_processed/PROVEDIt_1-5-Person CSVs Filtered"
+
+# 2. Sinh pool synthetic mixtures từ NoC=1 (chạy 1 lần, 5-15 phút)
+python main.py synth --n 30000 --max-noc 5
+
+# 3. Pretrain NoCNet-v2 (synthetic dominant + real)
+python main.py train --model nocnet_v2 --epochs 100 --batch-size 16 \
+    --p-synth 0.85 --samples-per-epoch 4000 --split grouped
+
+# 4. Fine-tune trên PROVEDIt thật
+python main.py finetune --checkpoint results/best_nocnet_v2.pt \
+    --epochs 40 --lr 1e-5 --tag nocnet_v2_ft
+```
+
+Cuối cùng có thể chạy 5-fold grouped CV để có bảng so sánh fair với baseline và các model cũ:
+
+```bash
+python main.py cv --models mac rf deepnoc_full nocformer nocnet_v2 \
+    --folds 5 --epochs 80
+```
+
+Trên GPU 16 GB tăng quy mô:
+
+```bash
+python main.py synth --n 100000 --max-noc 5
+python main.py train --model nocnet_v2 --epochs 150 --batch-size 64 \
+    --samples-per-epoch 8000 --p-synth 0.85
+python main.py finetune --checkpoint results/best_nocnet_v2.pt --epochs 60
+```
+
+Mặc định peak VRAM:
+- `--batch-size 16` ≈ 0.7 GiB
+- `--batch-size 32` ≈ 1.3 GiB
+- `--batch-size 64` ≈ ~2.5 GiB
+
+Train trên CPU vẫn chạy được nhưng sẽ rất chậm.
 
 ## Trạng thái hiện tại
 
@@ -32,21 +86,27 @@ Output mặc định được lưu tại:
 
 ```text
 deepNoC/
-├── main.py
+├── main.py                  # CLI entrypoint: prepare/synth/train/finetune/cv/...
 ├── src/
 │   ├── constants.py
-│   ├── data_loader.py
+│   ├── data_loader.py       # GeneMapper CSV -> [N, 24, 50, 89] tensor
+│   ├── synth.py             # Sinh synthetic mixtures + physics (stutter/dropout/noise)
+│   ├── split.py             # stratified / grouped split
+│   ├── cv.py                # 5-fold grouped CV runner
 │   └── evaluation.py
 ├── models/
 │   ├── baseline/
-│   │   └── baselines.py
-│   └── deepnoc/
+│   │   └── baselines.py     # MAC + Random Forest
+│   ├── deepnoc/             # CNN gốc theo paper (simple / full)
+│   ├── nocformer/           # Transformer cũ
+│   └── nocnet_v2/           # MỚI: Deep Sets + stutter-bias attn + count head
 │       ├── architecture.py
 │       ├── losses.py
-│       └── train.py
+│       └── train.py         # gồm cả finetune_nocnet_v2()
 ├── data/
 │   ├── provedit_raw/
-│   └── provedit_processed/
+│   ├── provedit_processed/  # X_gf25.npy, y_gf25.npy, sample_names.txt
+│   └── synthetic/           # X.npy, y.npy, mix.npy, locus_nall.npy
 ├── results/
 ├── pyproject.toml
 └── README.md
@@ -359,6 +419,49 @@ Phần dữ liệu hiện tại có vài giới hạn quan trọng:
 
 Vì vậy, phần định dạng dữ liệu hiện tại phù hợp để chạy baseline, train thử và phân tích mô hình `NoC`, nhưng chưa nên coi là bản tái hiện hoàn chỉnh toàn bộ pipeline dữ liệu của bài báo.
 
+## NoCNet-v2: kiến trúc và lý do
+
+NoCNet-v2 là bản kiến trúc mới được thiết kế riêng cho bài toán NoC trên PROVEDIt nhỏ. Mục tiêu là khắc phục 3 vấn đề chính của các model cũ:
+
+1. **Dữ liệu multi-contributor cực ít** (NoC=2..5 chỉ ~160-176 profile mỗi class). → giải bằng synthetic mixture pool sinh từ NoC=1.
+2. **Pooling bằng CLS-token làm mất tín hiệu "count"**. → giải bằng Deep Sets `[sum, max, log1p(count)]`.
+3. **Self-attention không có inductive bias cho stutter**. → giải bằng allele-distance attention bias.
+
+Sơ đồ chính:
+
+```text
+[B, 24, 50, 89]
+  -> PeakEmbedder (89 -> 96)
+  -> 2x StutterBiasAttention   (attn logits + MLP(allele_i - allele_j))
+  -> DeepSetsPool [sum, max, log1p(count)]   <- count-preserving
+  -> 2x CrossLocusTransformer  (dye + locus pos)
+  -> ProfilePool [sum, mean, max]
+  -> CountAwareHead -> {softmax, scalar, CORN}   <- ensemble 3 view
+  + aux per-locus n_alleles head (chỉ học khi sample là synthetic)
+```
+
+Model ~574k params, peak VRAM ~1.3 GiB ở batch=32.
+
+## Synthetic mixture pool (`src/synth.py`)
+
+Sinh dữ liệu trộn lên đến 5 contributor từ pool NoC=1, có physics đầy đủ:
+
+- siêu vị (superposition) chiều cao peak theo trọng số Dirichlet,
+- tái sinh stutter (back / dbl-back / forward / 0.2) quanh từng parent peak với tỉ lệ kỳ vọng ± CV,
+- allelic dropout xác suất `p = 0.30 * exp(-h / 250)`,
+- baseline noise peak `Poisson(0.5)` mỗi locus,
+- gom (rebucket) stutter và peak thật ở cùng allele rồi mới lọc theo LOD,
+- ghi lại nhãn ground-truth (NoC, mix proportions sorted, true n_alleles per locus) trước khi thêm artefact.
+
+Lệnh sinh:
+
+```bash
+python main.py synth --n 30000 --max-noc 5
+# tuỳ chọn: --alpha 1.5 --threshold 50 --jitter 0.08
+```
+
+Output `data/synthetic/X.npy`, `y.npy`, `mix.npy`, `locus_nall.npy`. Đọc bằng `np.memmap` lúc train, không tốn RAM.
+
 ## Cách chạy
 
 ### 1. Chuẩn bị dữ liệu
@@ -367,12 +470,7 @@ Vì vậy, phần định dạng dữ liệu hiện tại phù hợp để chạ
 python main.py prepare --data-dir "data/provedit_processed/PROVEDIt_1-5-Person CSVs Filtered"
 ```
 
-Lệnh này sẽ:
-
-- đọc file CSV/XLSX phù hợp,
-- parse sample name để suy ra `NoC`,
-- build tensor `X`,
-- lưu `X_gf25.npy`, `y_gf25.npy`, `sample_names.txt`.
+Lưu `X_gf25.npy`, `y_gf25.npy`, `sample_names.txt` vào `data/provedit_processed/`.
 
 ### 2. Chạy baseline
 
@@ -380,61 +478,87 @@ Lệnh này sẽ:
 python main.py baseline
 ```
 
-Baseline hiện có:
+`MAC` + `Random Forest` trên summary features. Lưu metrics/confusion matrix vào `results/`.
 
-- `MAC` rule-based
-- `Random Forest` trên summary features trích từ tensor `[24, 50, 89]`
-
-Kết quả và confusion matrix được lưu trong thư mục `results/`.
-
-### 3. Train model
-
-Model đơn giản:
+### 3. Sinh synthetic pool
 
 ```bash
-python main.py train --model simple
+python main.py synth --n 30000 --max-noc 5
 ```
 
-Model đầy đủ:
+### 4. Pretrain NoCNet-v2
 
 ```bash
-python main.py train --model full
+python main.py train --model nocnet_v2 --epochs 100 --batch-size 16 \
+    --p-synth 0.85 --samples-per-epoch 4000 --split grouped
 ```
 
-Có thể chỉnh các tham số chính:
+Lưu best checkpoint `results/best_nocnet_v2.pt`. Trong tail 25% epoch sẽ tự kích hoạt SWA (Stochastic Weight Averaging) và pick best giữa live model vs SWA model.
+
+Knob quan trọng:
+
+- `--p-synth` (default 0.8): tỉ lệ sample synthetic mỗi batch
+- `--samples-per-epoch`: số lần lấy mẫu mỗi epoch
+- `--d-model 96 --peak-layers 2 --locus-layers 2`: kích thước default đã được fit cho 6 GB VRAM
+- `--no-synth`: tắt synthetic pool nếu chỉ muốn train trên real
+
+### 5. Fine-tune trên dữ liệu thật
 
 ```bash
-python main.py train --model simple --epochs 500 --batch-size 64 --lr 1e-5
+python main.py finetune --checkpoint results/best_nocnet_v2.pt \
+    --epochs 40 --lr 1e-5 --tag nocnet_v2_ft
 ```
 
-Lưu ý:
+Fine-tune chỉ chạy trên real PROVEDIt, low LR. Trước khi train sẽ eval baseline của checkpoint pretrain để best-ckpt không bao giờ tệ hơn pretrain. SWA cũng được dùng trong tail.
 
-- `simple` là lựa chọn thực dụng hơn để kiểm tra pipeline
-- `full` dùng kiến trúc nhiều head/output hơn, nhưng trong training loop hiện tại trọng tâm vẫn là `profile_noc`
+Tuỳ chọn `--freeze-peak` để chỉ fine-tune cross-locus + heads, giữ peak encoder cố định (nên dùng nếu real data quá ít).
 
-### 4. Đánh giá checkpoint
+### 6. Train model cũ (tham khảo)
+
+```bash
+python main.py train --model simple   # deepNoC CNN gốc
+python main.py train --model full     # deepNoC full, nhiều aux head
+python main.py train --model nocformer
+```
+
+Lưu ý: số liệu cũ trong `results/` được tính trên split `alternating`. Split này leak replicate giữa train/test (xem `src/split.py:1-9`), nên accuracy bị thổi phồng. Để so sánh fair phải dùng `--split grouped` hoặc chạy `cv`.
+
+### 7. Đánh giá checkpoint riêng lẻ
 
 ```bash
 python main.py evaluate --checkpoint results/best_model_simple.pt --model simple
-```
-
-Hoặc:
-
-```bash
 python main.py evaluate --checkpoint results/best_model_full.pt --model full
 ```
 
-### 5. Chạy toàn bộ pipeline
+### 8. 5-fold grouped cross-validation
+
+```bash
+python main.py cv --models mac rf deepnoc_full nocformer nocnet_v2 \
+    --folds 5 --epochs 80 --batch-size 16
+```
+
+Group key được trích từ pedigree trong sample name (`src/split.py:_pedigree_key`), đảm bảo replicate cùng một mẫu sinh học không nằm cả ở train và test. Output:
+
+- `results/cv/<model>/fold<k>/metrics.json`
+- `results/cv/<model>/summary.json` — mean ± std cho accuracy, MAE, off-by-one acc, macro-F1
+- `results/cv/summary_all.json` — tất cả model trong cùng file
+
+### 9. Chạy toàn bộ pipeline cũ
 
 ```bash
 python main.py all
 ```
 
-Lệnh này sẽ:
+Lệnh này chỉ chạy `prepare → baseline → train` model cũ. Pipeline mới (NoCNet-v2 + synth + finetune) chưa được gộp vào `all` — chạy từng bước theo `### 1` -> `### 5`.
 
-- `prepare` nếu chưa có `.npy`
-- chạy baseline
-- train model
+## Cấu hình theo phần cứng
+
+| GPU VRAM | Đề xuất                                                                  |
+|---------:|--------------------------------------------------------------------------|
+| 6 GB     | `--batch-size 16 --samples-per-epoch 4000 --n 30000 --epochs 80`         |
+| 12 GB    | `--batch-size 32 --samples-per-epoch 6000 --n 60000 --epochs 120`        |
+| 16+ GB   | `--batch-size 64 --samples-per-epoch 8000 --n 100000 --epochs 150`       |
+| CPU      | `--batch-size 8 --samples-per-epoch 1000 --n 10000 --epochs 30` (chậm)   |
 
 ## Kết quả đầu ra
 
@@ -444,82 +568,63 @@ Trong `results/`, repo hiện sinh ra các file như:
 - `metrics_*.json`
 - `threshold_*.png`
 - `training_history_*.png`
-- `best_model_*.pt`
+- `best_model_*.pt`, `best_nocformer.pt`, `best_nocnet_v2.pt`, `best_nocnet_v2_ft.pt`
 - `checkpoint_*_ep*.pt`
-- `history_*.json`
+- `history_*.json` (bao gồm `swa_test_acc` cho NoCNet-v2)
+
+CV runner thêm:
+
+- `results/cv/<model>/fold<k>/metrics.json`
+- `results/cv/<model>/summary.json`
+- `results/cv/summary_all.json`
 
 ## Những gì đã đúng với code hiện tại
 
-- Có thể prepare dữ liệu từ PROVEDIt CSV/XLSX
-- Đã sửa parsing `NoC` cho sample name kiểu `-1;1-`, `-1;2;1-`, `-1;1;1;1-`
-- Có split train/test xen kẽ bằng `train_test_split_alternating()`
-- Có baseline `MAC` và `Random Forest`
-- Có 2 chế độ train: `simple` và `full`
-- Có module đánh giá và lưu hình/metrics
+- Prepare dữ liệu từ PROVEDIt CSV/XLSX, parse sample name `-1;1-`, `-1;2;1-`, `-1;1;1;1-`.
+- 3 chiến lược split: `alternating` (leak — chỉ giữ cho tương thích), `stratified`, `grouped` (khuyến nghị).
+- Baseline `MAC` + `Random Forest`.
+- 4 nhánh model: `simple`, `full`, `nocformer`, `nocnet_v2`.
+- Synthetic mixture generator có physics (stutter regen + dropout + noise + LOD).
+- SWA tự kích hoạt trong tail 25% epoch khi train `nocnet_v2`.
+- Fine-tune real-only với baseline-guard (best ckpt không bao giờ tệ hơn pretrain).
+- 5-fold grouped CV runner so sánh các model trên cùng split.
+- Module đánh giá: accuracy, MAE, off-by-one acc, macro-F1, confusion matrix.
 
 ## Những gì chưa nên nói quá mức
 
-Repo này chưa phải bản tái hiện hoàn chỉnh toàn bộ paper theo nghĩa chặt. Cụ thể:
+- Allele frequency vẫn là default xấp xỉ, chưa nạp bảng tần suất thực tế.
+- Peak label probability đầu vào là heuristic; chưa thay bằng MHCNN như paper.
+- Mixture proportion feature 80-89 (heuristic smart-start) chỉ dùng làm input feature; với NoCNet-v2 nhãn `mix_props` dùng để supervise là ground truth THẬT (vì sample là synthetic do mình sinh ra).
+- Số liệu cũ `deepnoc_full = 82%` được tính trên split `alternating` bị leak. Số honest chỉ có sau khi chạy `cv` với split `grouped`.
 
-- chưa có pipeline mô phỏng dữ liệu lớn như trong paper,
-- chưa có toàn bộ label phụ được sinh đầy đủ từ ground truth thực nghiệm,
-- nhánh `full` có nhiều output phụ trong kiến trúc, nhưng training hiện tại chủ yếu tối ưu `profile_noc`,
-- chưa có bộ benchmark cố định được chốt lại trong README.
+## Roadmap thực tế
 
-Nói ngắn gọn: repo đang là một bản triển khai thực dụng để chạy dữ liệu PROVEDIt và so sánh baseline với model học sâu cho bài toán `NoC`.
+### Phase 1: pipeline ổn định + honest baseline
 
-## Roadmap 3 tuần
+- `prepare` dữ liệu PROVEDIt
+- chạy `baseline` (`MAC`, `RF`)
+- chạy `cv --models mac rf deepnoc_full nocformer --folds 5` để có honest benchmark trên grouped split
+- lưu `results/cv/summary_all.json` làm mốc so sánh
 
-### Tuần 1: Chốt pipeline dữ liệu và baseline
+### Phase 2: pretrain + finetune NoCNet-v2
 
-- xác nhận lại số profile sau `prepare` là ổn định,
-- kiểm tra nhanh chất lượng tensor và phân bố `NoC`,
-- chạy `MAC` và `Random Forest`,
-- lưu lại metrics baseline làm mốc so sánh.
+- `synth --n 30000`
+- `train --model nocnet_v2 --epochs 100 --split grouped`
+- `finetune --checkpoint results/best_nocnet_v2.pt --epochs 40`
+- `cv --models nocnet_v2` để có CI của model mới
 
-Deliverable:
+### Phase 3: tối ưu nếu cần thêm điểm
 
-- `X_gf25.npy`, `y_gf25.npy`, `sample_names.txt`
-- confusion matrix và metrics cho baseline
-
-### Tuần 2: Ổn định training cho model `simple`
-
-- train `simple` với vài cấu hình `epochs`, `batch size`, `lr`,
-- theo dõi overfitting qua `training_history`,
-- chốt một checkpoint `simple` tốt nhất,
-- so sánh trực tiếp với baseline trên cùng split.
-
-Deliverable:
-
-- `best_model_simple.pt`
-- `history_simple.json`
-- bảng so sánh `MAC` vs `RF` vs `simple`
-
-### Tuần 3: Thử `full` và viết báo cáo ngắn
-
-- chạy `full` để kiểm tra xem có cải thiện thực sự không,
-- nếu `full` không ổn định hoặc không hơn `simple`, giữ `simple` làm kết quả chính,
-- tổng hợp kết quả cuối: dữ liệu, split, baseline, model, confusion matrix, nhận xét lỗi thường gặp.
-
-Deliverable:
-
-- `best_model_full.pt` nếu có cải thiện
-- bộ hình và metrics cuối cùng trong `results/`
-- bản tóm tắt kết quả ngắn để dùng cho báo cáo hoặc thuyết trình
-
-## Lệnh gợi ý cho 3 tuần này
-
-```bash
-python main.py prepare --data-dir "data/provedit_processed/PROVEDIt_1-5-Person CSVs Filtered"
-python main.py baseline
-python main.py train --model simple --epochs 500
-python main.py train --model full --epochs 500
-python main.py evaluate --checkpoint results/best_model_simple.pt --model simple
-```
+- tăng synthetic pool: `synth --n 100000`
+- ensemble nhiều seed (train lại với `--seed`), trung bình probs
+- per-class threshold tuning trên val để tối ưu macro-F1
+- pseudo-labeling profile high-confidence để thêm dữ liệu real
 
 ## Ghi chú thực dụng
 
-- Nếu train trên CPU, nên giảm `epochs` trước để kiểm tra pipeline.
-- Nếu có GPU CUDA, `torch` sẽ tự dùng GPU.
-- Nếu cần lặp lại thí nghiệm nhiều lần, nên cố định thêm seed trong training và split.
-- Nếu muốn README bám sát kết quả hơn nữa, bước tiếp theo hợp lý là chạy lại `baseline` và `train simple` rồi ghi con số thật vào đây.
+- Train trên CPU vẫn được nhưng synth+train sẽ rất chậm; nên thử với `--n 5000 --epochs 10` để dry-run trước.
+- GPU CUDA: `torch` tự detect. NoCNet-v2 mặc định ~700 MiB ở batch 16, ~1.3 GiB ở batch 32.
+- Cố định seed: `--seed 42` ở `train` / `finetune` / `cv` để reproduce.
+- Synthetic pool sinh 1 lần dùng nhiều lần. Train xong cứ giữ `data/synthetic/` cho lần chạy sau.
+- Nếu `cv` báo lỗi 1 model, các model còn lại vẫn chạy tiếp (lỗi được nuốt + log).
+- Memmap synthetic pool: file `data/synthetic/X.npy` có thể 5-20 GB tuỳ `--n`; bảo đảm đủ ổ cứng.

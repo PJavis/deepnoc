@@ -139,6 +139,38 @@ def cmd_train(args):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    if args.model == "nocnet_v2":
+        from models.nocnet_v2.train import (
+            train_nocnet_v2, predict_nocnet_v2, TrainConfig,
+        )
+        cfg = TrainConfig(
+            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+            weight_decay=args.weight_decay, d_model=args.d_model,
+            n_heads=args.n_heads, peak_layers=args.peak_layers,
+            locus_layers=args.locus_layers, dropout=args.dropout,
+            early_stop_patience=args.early_stop_patience,
+            p_synth=args.p_synth, samples_per_epoch=args.samples_per_epoch,
+        )
+        model, history = train_nocnet_v2(
+            X_train, y_train, X_test, y_test,
+            num_classes=num_classes,
+            synth_dir=(None if args.no_synth else args.synth_dir),
+            config=cfg, save_dir=args.results_dir,
+            tag="nocnet_v2", device=device,
+        )
+        plot_training_history(
+            history, title="NoCNet-v2",
+            save_path=os.path.join(args.results_dir, "training_history_nocnet_v2.png"),
+        )
+        print("\n--- Final Evaluation on Test Set ---")
+        probs, preds = predict_nocnet_v2(model, X_test,
+                                         batch_size=args.batch_size,
+                                         device=device)
+        labels = sorted(set(y_test))
+        full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
+                        title="NoCNet-v2", save_dir=args.results_dir)
+        return
+
     if args.model == "nocformer":
         from models.nocformer.train import train_nocformer, predict_with_tta
         model, history = train_nocformer(
@@ -215,6 +247,90 @@ def cmd_train(args):
     labels = sorted(set(y_test))
     full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
                     title=f"deepNoC_{args.model}", save_dir=args.results_dir)
+
+
+def cmd_synth(args):
+    """Generate synthetic mixture pool from NoC=1 PROVEDIt profiles."""
+    from src.synth import synthesise
+
+    X = np.load(os.path.join(args.output_dir, "X_gf25.npy"))
+    y = np.load(os.path.join(args.output_dir, "y_gf25.npy"))
+    pool = X[y == 1].astype(np.float32)
+    print(f"[synth] pool size (NoC=1): {pool.shape[0]}")
+    Xs, ys, mix, nall = synthesise(
+        pool, n_samples=args.n, max_noc=args.max_noc,
+        dirichlet_alpha=args.alpha,
+        detection_threshold=args.threshold,
+        height_jitter_sigma=args.jitter, rng_seed=args.seed,
+    )
+    os.makedirs(args.synth_dir, exist_ok=True)
+    np.save(os.path.join(args.synth_dir, "X.npy"), Xs)
+    np.save(os.path.join(args.synth_dir, "y.npy"), ys)
+    np.save(os.path.join(args.synth_dir, "mix.npy"), mix)
+    np.save(os.path.join(args.synth_dir, "locus_nall.npy"), nall)
+    uniq, cnt = np.unique(ys, return_counts=True)
+    print(f"[synth] wrote {args.n} profiles to {args.synth_dir}")
+    print(f"[synth] NoC distribution: {dict(zip(uniq.tolist(), cnt.tolist()))}")
+
+
+def cmd_cv(args):
+    """Run 5-fold grouped cross-validation across selected models."""
+    from src.cv import cross_validate, _load_data
+    X, y, names = _load_data(args.output_dir)
+    print(f"Loaded X={X.shape} y={y.shape} names={len(names)}")
+    cross_validate(
+        X, y, names,
+        models=args.models,
+        n_folds=args.folds,
+        seed=args.seed,
+        results_root=args.cv_results_dir,
+        synth_dir=args.synth_dir,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+    )
+
+
+def cmd_finetune(args):
+    """Fine-tune a NoCNet-v2 synthetic-pretrained checkpoint on real PROVEDIt."""
+    from models.nocnet_v2.train import finetune_nocnet_v2
+    from src.evaluation import full_evaluation, plot_training_history
+    from models.nocnet_v2.train import predict_nocnet_v2
+
+    X, y = load_data(args)
+    names = _load_names(args) or [str(i) for i in range(len(y))]
+    if len(names) != len(y):
+        names = [str(i) for i in range(len(y))]
+    X_train, X_test, y_train, y_test, _, _ = _split(X, y, names, args)
+
+    num_classes = int(y.max())
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    model, history = finetune_nocnet_v2(
+        args.checkpoint, X_train, y_train, X_test, y_test,
+        num_classes=num_classes,
+        epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
+        weight_decay=args.weight_decay,
+        samples_per_epoch=args.samples_per_epoch,
+        swa_frac=args.swa_frac,
+        jitter_sigma=args.jitter_sigma,
+        dropout_p=args.dropout_p,
+        save_dir=args.results_dir,
+        tag=args.tag,
+        freeze_peak_stages=args.freeze_peak,
+        device=device,
+    )
+    plot_training_history(
+        history, title="NoCNet-v2 finetune",
+        save_path=os.path.join(args.results_dir,
+                               f"training_history_{args.tag}.png"),
+    )
+    probs, preds = predict_nocnet_v2(model, X_test,
+                                     batch_size=args.batch_size,
+                                     device=device)
+    labels = sorted(set(y_test))
+    full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
+                    title=f"NoCNet-v2_{args.tag}", save_dir=args.results_dir)
 
 
 def cmd_evaluate(args):
@@ -321,9 +437,10 @@ def main():
     # Train command
     p_train = subparsers.add_parser('train', parents=[common],
                                      help='Train deepNoC or NoCFormer')
-    p_train.add_argument('--model', choices=['full', 'simple', 'nocformer'],
-                         default='nocformer',
-                         help='Model: full / simple (deepNoC) or nocformer')
+    p_train.add_argument('--model',
+                         choices=['full', 'simple', 'nocformer', 'nocnet_v2'],
+                         default='nocnet_v2',
+                         help='Model: full / simple (deepNoC), nocformer, nocnet_v2')
     p_train.add_argument('--epochs', type=int, default=200,
                          help='Number of training epochs')
     p_train.add_argument('--batch-size', type=int, default=32,
@@ -353,7 +470,63 @@ def main():
                          help='Disable TTA evaluation and use deterministic predictions')
     p_train.add_argument('--tta-samples', type=int, default=20,
                          help='MC-Dropout / TTA samples at evaluation time')
+    # NoCNet-v2-only knobs
+    p_train.add_argument('--synth-dir', default='data/synthetic',
+                         help='Path to synthetic-pool .npy files (NoCNet-v2)')
+    p_train.add_argument('--no-synth', action='store_true',
+                         help='Disable synthetic data even if present')
+    p_train.add_argument('--p-synth', type=float, default=0.8,
+                         help='Fraction of batch drawn from synthetic pool')
+    p_train.add_argument('--samples-per-epoch', type=int, default=4000,
+                         help='Hybrid loader iterations per epoch')
     
+    # Synth command
+    p_synth = subparsers.add_parser('synth', parents=[common],
+                                    help='Generate synthetic mixture pool')
+    p_synth.add_argument('--synth-dir', default='data/synthetic')
+    p_synth.add_argument('--n', type=int, default=20_000)
+    p_synth.add_argument('--max-noc', type=int, default=5)
+    p_synth.add_argument('--alpha', type=float, default=1.5)
+    p_synth.add_argument('--threshold', type=float, default=50.0)
+    p_synth.add_argument('--jitter', type=float, default=0.08)
+    p_synth.add_argument('--seed', type=int, default=0)
+
+    # CV command
+    p_cv = subparsers.add_parser('cv', parents=[common],
+                                 help='5-fold grouped cross-validation')
+    p_cv.add_argument('--cv-results-dir', default='results/cv')
+    p_cv.add_argument('--synth-dir', default='data/synthetic')
+    p_cv.add_argument('--models', nargs='+',
+                      default=['mac', 'rf', 'nocnet_v2'],
+                      choices=['mac', 'rf', 'deepnoc_simple', 'deepnoc_full',
+                               'nocformer', 'nocnet_v2'])
+    p_cv.add_argument('--folds', type=int, default=5)
+    p_cv.add_argument('--epochs', type=int, default=60)
+    p_cv.add_argument('--batch-size', type=int, default=16)
+    p_cv.add_argument('--lr', type=float, default=3e-4)
+    p_cv.add_argument('--seed', type=int, default=42)
+
+    # Finetune command
+    p_ft = subparsers.add_parser('finetune', parents=[common],
+                                 help='Fine-tune NoCNet-v2 on real PROVEDIt')
+    p_ft.add_argument('--checkpoint', required=True,
+                      help='Synth-pretrained NoCNet-v2 ckpt (best_nocnet_v2.pt)')
+    p_ft.add_argument('--epochs', type=int, default=30)
+    p_ft.add_argument('--lr', type=float, default=1e-5)
+    p_ft.add_argument('--batch-size', type=int, default=16)
+    p_ft.add_argument('--weight-decay', type=float, default=1e-4)
+    p_ft.add_argument('--samples-per-epoch', type=int, default=1500)
+    p_ft.add_argument('--swa-frac', type=float, default=0.4)
+    p_ft.add_argument('--jitter-sigma', type=float, default=0.05)
+    p_ft.add_argument('--dropout-p', type=float, default=0.01)
+    p_ft.add_argument('--freeze-peak', action='store_true',
+                      help='Freeze peak stages, only fine-tune cross-locus + heads')
+    p_ft.add_argument('--tag', default='nocnet_v2_ft')
+    p_ft.add_argument('--split', choices=['alternating', 'stratified', 'grouped'],
+                      default='grouped')
+    p_ft.add_argument('--test-size', type=float, default=0.25)
+    p_ft.add_argument('--seed', type=int, default=42)
+
     # Evaluate command
     p_eval = subparsers.add_parser('evaluate', parents=[common],
                                     help='Evaluate checkpoint')
@@ -387,6 +560,9 @@ def main():
         'train': cmd_train,
         'evaluate': cmd_evaluate,
         'all': cmd_all,
+        'synth': cmd_synth,
+        'cv': cmd_cv,
+        'finetune': cmd_finetune,
     }
     
     commands[args.command](args)
