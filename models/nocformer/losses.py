@@ -26,14 +26,16 @@ import torch.nn.functional as F
 def corn_loss(logits: torch.Tensor, targets: torch.Tensor,
               num_classes: int,
               class_weights: torch.Tensor | None = None,
-              focal_gamma: float = 0.0) -> torch.Tensor:
+              focal_gamma: float = 0.0,
+              label_smoothing: float = 0.1) -> torch.Tensor:
     """
-    CORN loss.
+    CORN loss with label smoothing.
 
     logits:   [B, K-1] = log-odds of P(y > k) for k = 1..K-1
     targets:  [B]      with values in 1..K (1-indexed NoC labels)
     class_weights: optional [K] weights applied per sample by its true class
     focal_gamma:   focal-loss focusing parameter; 0 disables focal weighting
+    label_smoothing: smoothing factor (0-1); smooths binary targets toward 0.5
 
     Note: each task k uses ONLY the samples whose target > k-1, i.e. the
     "conditional training" trick that makes CORN rank-monotonic.
@@ -50,7 +52,9 @@ def corn_loss(logits: torch.Tensor, targets: torch.Tensor,
             continue
         z = logits[mask, k]
         y = (targets0[mask] > k).float()
-        bce = F.binary_cross_entropy_with_logits(z, y, reduction="none")
+        # Apply label smoothing
+        y_smooth = y * (1.0 - label_smoothing) + 0.5 * label_smoothing
+        bce = F.binary_cross_entropy_with_logits(z, y_smooth, reduction="none")
         if focal_gamma > 0:
             # The focusing term itself does not need grad — but the
             # multiplication on `bce` MUST stay in the graph.
@@ -61,7 +65,7 @@ def corn_loss(logits: torch.Tensor, targets: torch.Tensor,
             bce = bce * focal_w
         if class_weights is not None:
             # weight each kept sample by the weight of its true class
-            cls = targets0[mask]
+            cls = targets0[mask].long()  # ensure long for indexing
             bce = bce * class_weights[cls]
         total = total + bce.mean()
         n_terms += 1
@@ -116,6 +120,7 @@ class NoCFormerLoss(nn.Module):
         class_counts: torch.Tensor | None = None,
         focal_gamma: float = 1.0,
         cb_beta: float = 0.999,
+        label_smoothing: float = 0.1,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -126,6 +131,7 @@ class NoCFormerLoss(nn.Module):
         self.locus_mix_weight = locus_mix_weight
         self.profile_mix_weight = profile_mix_weight
         self.focal_gamma = focal_gamma
+        self.label_smoothing = label_smoothing
 
         if class_counts is not None:
             w = class_balanced_weights(class_counts, beta=cb_beta)
@@ -145,6 +151,7 @@ class NoCFormerLoss(nn.Module):
                 num_classes=self.num_classes,
                 class_weights=self.class_weights,
                 focal_gamma=self.focal_gamma,
+                label_smoothing=self.label_smoothing,
             )
             total = total + self.noc_weight * losses["noc"]
 

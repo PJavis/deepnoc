@@ -497,7 +497,7 @@ def load_provedit_dataset(data_dir: str,
                            kit_filter: str = "GF",
                            injection_filter: str = "25sec",
                            instrument_filter: str = "3500",
-                           max_1person: int = 70,
+                           max_1person: int | None = None,
                            verbose: bool = True) -> tuple:
     """
     Load and process PROVEDIt dataset from filtered CSV files.
@@ -507,6 +507,8 @@ def load_provedit_dataset(data_dir: str,
         kit_filter: Filter for profiling kit (e.g., 'GF' for GlobalFiler)
         injection_filter: Filter for injection time (e.g., '25sec')
         instrument_filter: Filter for instrument (e.g., '3500')
+        max_1person: Optional cap on how many NoC=1 profiles to keep (file order).
+            None means keep all parsed single-source profiles.
         verbose: Print progress
     
     Returns:
@@ -596,10 +598,9 @@ def load_provedit_dataset(data_dir: str,
             if noc < 1 or noc > 5:
                 continue
 
-            # === GIỚI HẠN SINGLE-SOURCE ===
-            if noc == 1:
+            if noc == 1 and max_1person is not None:
                 if one_person_count >= max_1person:
-                    continue  # Bỏ qua các single-source thừa
+                    continue
                 one_person_count += 1
 
             total_peaks = len(sample_peaks)
@@ -616,7 +617,8 @@ def load_provedit_dataset(data_dir: str,
     y = np.array(all_y, dtype=np.int64)
 
     if verbose:
-        print(f"\nLoaded {len(X)} profiles (max_1person={max_1person})")
+        cap = max_1person if max_1person is not None else "none"
+        print(f"\nLoaded {len(X)} profiles (max_1person cap={cap})")
         for noc in sorted(np.unique(y)):
             count = np.sum(y == noc)
             print(f"  NoC={noc}: {count} profiles")

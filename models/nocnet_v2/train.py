@@ -141,11 +141,10 @@ class SynthProfileDataset(Dataset):
 
     def __init__(self, synth_dir: str, augment: bool = True,
                  augment_cfg: dict | None = None):
-        self.X = np.load(os.path.join(synth_dir, "X.npy"), mmap_mode="r")
-        self.y = np.load(os.path.join(synth_dir, "y.npy"), mmap_mode="r")
-        self.mix = np.load(os.path.join(synth_dir, "mix.npy"), mmap_mode="r")
-        self.nall = np.load(os.path.join(synth_dir, "locus_nall.npy"),
-                            mmap_mode="r")
+        self.X = np.load(os.path.join(synth_dir, "X.npy"), allow_pickle=True)
+        self.y = np.load(os.path.join(synth_dir, "y.npy"), allow_pickle=True)
+        self.mix = np.load(os.path.join(synth_dir, "mix.npy"), allow_pickle=True)
+        self.nall = np.load(os.path.join(synth_dir, "locus_nall.npy"), allow_pickle=True)
         self.augment = augment
         self.cfg = augment_cfg or {}
         self.rng = np.random.default_rng()
@@ -265,6 +264,11 @@ class TrainConfig:
     # training to land in a wider, more generalisable minimum. Disabled when
     # `swa_frac` <= 0.
     swa_frac: float = 0.25
+    label_smoothing: float = 0.1
+    # MixUp on input tensors; λ ~ Beta(mixup_alpha, mixup_alpha), applied with
+    # probability mixup_prob. Loss = λ L(out, targets) + (1-λ) L(out, targets').
+    mixup_alpha: float = 0.2
+    mixup_prob: float = 0.5
 
 
 def _class_counts(y: np.ndarray, num_classes: int) -> torch.Tensor:
@@ -336,7 +340,8 @@ def train_nocnet_v2(
 
     class_counts = _class_counts(y_train, num_classes).to(device)
     criterion = NoCNetV2Loss(num_classes=num_classes,
-                             class_counts=class_counts).to(device)
+                             class_counts=class_counts,
+                             label_smoothing=cfg.label_smoothing).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr,
                             weight_decay=cfg.weight_decay)
@@ -374,14 +379,43 @@ def train_nocnet_v2(
             nall = batch["nall"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(x)
-            losses = criterion(out, {
-                "profile_noc": y,
-                "is_synth": is_synth,
-                "profile_mix_props": mix,
-                "locus_n_alleles": nall,
-            })
-            loss = losses["total"]
+
+            use_mixup = (
+                cfg.mixup_alpha > 0.0
+                and x.size(0) > 1
+                and torch.rand(1, device=device).item() < cfg.mixup_prob
+            )
+            if use_mixup:
+                lam = float(
+                    torch.distributions.Beta(
+                        cfg.mixup_alpha, cfg.mixup_alpha
+                    ).sample().item()
+                )
+                perm = torch.randperm(x.size(0), device=device)
+                x = lam * x + (1.0 - lam) * x[perm]
+                out = model(x)
+                losses_a = criterion(out, {
+                    "profile_noc": y,
+                    "is_synth": is_synth,
+                    "profile_mix_props": mix,
+                    "locus_n_alleles": nall,
+                })
+                losses_b = criterion(out, {
+                    "profile_noc": y[perm],
+                    "is_synth": is_synth[perm],
+                    "profile_mix_props": mix[perm],
+                    "locus_n_alleles": nall[perm],
+                })
+                loss = lam * losses_a["total"] + (1.0 - lam) * losses_b["total"]
+            else:
+                out = model(x)
+                losses = criterion(out, {
+                    "profile_noc": y,
+                    "is_synth": is_synth,
+                    "profile_mix_props": mix,
+                    "locus_n_alleles": nall,
+                })
+                loss = losses["total"]
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(),
                                            max_norm=cfg.grad_clip)
@@ -560,6 +594,9 @@ def finetune_nocnet_v2(
         dropout_p=dropout_p,
         seed=0,
         swa_frac=swa_frac,
+        label_smoothing=0.05,
+        mixup_alpha=0.0,
+        mixup_prob=0.0,
     )
 
     # Re-implement the training loop with a pre-built model rather than
@@ -581,7 +618,8 @@ def finetune_nocnet_v2(
 
     class_counts = _class_counts(y_train, num_classes).to(device)
     criterion = NoCNetV2Loss(num_classes=num_classes,
-                             class_counts=class_counts).to(device)
+                             class_counts=class_counts,
+                             label_smoothing=cfg.label_smoothing).to(device)
     optimizer = optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg.lr, weight_decay=cfg.weight_decay,

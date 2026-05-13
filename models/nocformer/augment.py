@@ -244,6 +244,8 @@ class AugmentConfig:
     noise_peaks: int = 2
     noise_height_scale: float = 0.05
     shuffle_peaks: bool = True
+    p_mixup: float = 0.3               # MixUp probability per batch
+    mixup_alpha: float = 1.0            # Beta distribution parameter
 
 
 class TrainingAugmenter:
@@ -307,3 +309,50 @@ class TrainingAugmenter:
         return (torch.stack(out_x),
                 torch.tensor(out_y, dtype=torch.long),
                 torch.stack(out_mix))
+
+
+class MixUp:
+    """
+    MixUp data augmentation: linearly interpolate profiles in feature space.
+    
+    For batch B profiles, randomly select another sample and mix:
+        x_mixed = λ * x_i + (1 - λ) * x_j  where λ ~ Beta(α, α)
+        y_mixed blended as soft labels (kept as ordinal class for ordinal loss compatibility)
+    """
+    
+    def __init__(self, alpha: float = 1.0):
+        """
+        Args:
+            alpha: Beta distribution parameter (higher = more uniform mixing, 
+                   lower = more extreme mixing)
+        """
+        self.alpha = alpha
+    
+    def __call__(self, x: torch.Tensor, y: torch.Tensor
+                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Apply MixUp augmentation to a batch.
+        
+        Args:
+            x: [B, 24, 50, 89] batch of profiles
+            y: [B] batch of integer NoC labels (1 to MAX_NOC)
+        
+        Returns:
+            x_mixed: [B, 24, 50, 89] interpolated profiles
+            y_mixed: [B] blended labels (as float, clamped to valid range)
+            lam:     [B] mixing coefficients (for weighted loss, if needed)
+        """
+        batch_size = x.size(0)
+        lam = torch.from_numpy(
+            np.random.beta(self.alpha, self.alpha, batch_size)
+        ).to(x.dtype).to(x.device)
+        
+        idx = torch.randperm(batch_size).to(x.device)
+        x_mixed = lam.view(-1, 1, 1, 1) * x + (1 - lam).view(-1, 1, 1, 1) * x[idx]
+        
+        # Blend labels (keep in [1, MAX_NOC] range)
+        y_float = y.float()
+        y_mixed = lam * y_float + (1 - lam) * y_float[idx]
+        y_mixed = torch.clamp(y_mixed, 1.0, float(MAX_NOC))
+        
+        return x_mixed, y_mixed, lam

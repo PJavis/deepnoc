@@ -241,7 +241,9 @@ def synthesise(
     artefact_kwargs: dict | None = None,
     rng_seed: int = 0,
     verbose: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    out_dir: str | None = None,
+) -> Tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None,
+           np.ndarray | None]:
     """
     Generate `n_samples` synthetic profiles from a NoC=1 pool.
 
@@ -258,12 +260,14 @@ def synthesise(
                                height (after superposition, before features
                                are recomputed). 0 disables.
         rng_seed:              numpy RNG seed.
+        out_dir:               If set, stream outputs to memmap .npy files under
+                             this directory (no giant RAM allocation for X).
+                             Returns four None values; files are X.npy, y.npy,
+                             mix.npy, locus_nall.npy.
 
     Returns:
-        X    [n_samples, 24, 50, 89] float32
-        y    [n_samples] int64 (1..max_noc)
-        mix  [n_samples, MAX_NOC] float32 (sorted desc)
-        nall [n_samples, 24] int8 (true n_alleles per locus)
+        X, y, mix, nall arrays when out_dir is None; otherwise (None, None, None, None)
+        and arrays are written under out_dir.
     """
     if noc_weights is None:
         noc_weights = np.ones(max_noc, dtype=np.float64) / max_noc
@@ -278,11 +282,21 @@ def synthesise(
     decoded = [_decode_source_profile(pool[i]) for i in
                tqdm(range(pool.shape[0]), disable=not verbose, leave=False)]
 
-    X_out = np.zeros((n_samples, NUM_LOCI, MAX_PEAKS_PER_LOCUS,
-                      NUM_FEATURES_PER_PEAK), dtype=np.float32)
-    y_out = np.zeros(n_samples, dtype=np.int64)
-    mix_out = np.zeros((n_samples, MAX_NOC), dtype=np.float32)
-    nall_out = np.zeros((n_samples, NUM_LOCI), dtype=np.int8)
+    shape_x = (n_samples, NUM_LOCI, MAX_PEAKS_PER_LOCUS, NUM_FEATURES_PER_PEAK)
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        # Use regular arrays instead of memmap to avoid loading issues
+        X_out = np.zeros(shape_x, dtype=np.float32)
+        y_out = np.zeros(n_samples, dtype=np.int64)
+        mix_out = np.zeros((n_samples, MAX_NOC), dtype=np.float32)
+        nall_out = np.zeros((n_samples, NUM_LOCI), dtype=np.int8)
+        if verbose:
+            print(f"[synth] using in-memory arrays → {out_dir}")
+    else:
+        X_out = np.zeros(shape_x, dtype=np.float32)
+        y_out = np.zeros(n_samples, dtype=np.int64)
+        mix_out = np.zeros((n_samples, MAX_NOC), dtype=np.float32)
+        nall_out = np.zeros((n_samples, NUM_LOCI), dtype=np.int8)
 
     n_pool = len(decoded)
     if n_pool < max_noc:
@@ -340,6 +354,15 @@ def synthesise(
         written += 1
         pbar.update(1)
     pbar.close()
+
+    if out_dir is not None:
+        # Save arrays to disk
+        np.save(os.path.join(out_dir, "X.npy"), X_out)
+        np.save(os.path.join(out_dir, "y.npy"), y_out)
+        np.save(os.path.join(out_dir, "mix.npy"), mix_out)
+        np.save(os.path.join(out_dir, "locus_nall.npy"), nall_out)
+        return None, None, None, None
+
     return X_out, y_out, mix_out, nall_out
 
 
@@ -368,20 +391,17 @@ def main():
     pool = X[y == 1].astype(np.float32)
     print(f"[synth] NoC=1 pool: {pool.shape[0]} profiles")
 
-    Xs, ys, mix, nall = synthesise(
+    os.makedirs(args.out_dir, exist_ok=True)
+    synthesise(
         pool, n_samples=args.n, max_noc=args.max_noc,
         dirichlet_alpha=args.alpha,
         detection_threshold=args.threshold,
         height_jitter_sigma=args.jitter,
         rng_seed=args.seed,
+        out_dir=args.out_dir,
     )
-
-    os.makedirs(args.out_dir, exist_ok=True)
-    np.save(os.path.join(args.out_dir, "X.npy"), Xs)
-    np.save(os.path.join(args.out_dir, "y.npy"), ys)
-    np.save(os.path.join(args.out_dir, "mix.npy"), mix)
-    np.save(os.path.join(args.out_dir, "locus_nall.npy"), nall)
-    uniq, cnt = np.unique(ys, return_counts=True)
+    ys = np.load(os.path.join(args.out_dir, "y.npy"), allow_pickle=True)
+    uniq, cnt = np.unique(np.asarray(ys), return_counts=True)
     print(f"[synth] wrote {args.n} profiles to {args.out_dir}")
     print(f"[synth] NoC distribution: {dict(zip(uniq.tolist(), cnt.tolist()))}")
 

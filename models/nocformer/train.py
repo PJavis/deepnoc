@@ -27,7 +27,7 @@ from src.constants import MAX_NOC, NUM_LOCI, MAX_PEAKS_PER_LOCUS
 from models.nocformer.architecture import NoCFormer
 from models.nocformer.losses import NoCFormerLoss, corn_label_from_logits
 from models.nocformer.augment import (
-    AugmentConfig, TrainingAugmenter, peak_height_jitter, shuffle_peak_axis,
+    AugmentConfig, TrainingAugmenter, MixUp, peak_height_jitter, shuffle_peak_axis,
 )
 
 
@@ -106,6 +106,7 @@ def train_nocformer(
     # Single-source pool feeds the synthetic-mixture augmenter.
     pool = X_train_t[y_train_t == 1]
     augmenter = (TrainingAugmenter(pool, augment_cfg) if augment else None)
+    mixup = MixUp(alpha=1.0)  # MixUp with Beta(1, 1) = Uniform[0,1]
 
     sampler = _make_balanced_sampler(y_train)
     train_ds = TensorDataset(X_train_t, y_train_t)
@@ -130,6 +131,7 @@ def train_nocformer(
     class_counts = _make_class_counts(y_train, num_classes).to(device)
     criterion = NoCFormerLoss(
         num_classes=num_classes, class_counts=class_counts, focal_gamma=1.0,
+        label_smoothing=0.1,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -159,6 +161,9 @@ def train_nocformer(
                 x, y, mix = augmenter(x, y)
             else:
                 mix = None
+            # Apply MixUp augmentation (30% chance)
+            if torch.rand(()).item() < 0.3:
+                x, y, _ = mixup(x, y)
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             if mix is not None:

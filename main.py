@@ -34,6 +34,7 @@ def cmd_prepare(args):
         kit_filter=args.kit,
         injection_filter=args.injection,
         instrument_filter=args.instrument,
+        max_1person=args.max_1person,
     )
     
     out_dir = args.output_dir
@@ -150,6 +151,9 @@ def cmd_train(args):
             locus_layers=args.locus_layers, dropout=args.dropout,
             early_stop_patience=args.early_stop_patience,
             p_synth=args.p_synth, samples_per_epoch=args.samples_per_epoch,
+            label_smoothing=args.label_smoothing,
+            mixup_alpha=args.mixup_alpha,
+            mixup_prob=args.mixup_prob,
         )
         model, history = train_nocnet_v2(
             X_train, y_train, X_test, y_test,
@@ -257,18 +261,16 @@ def cmd_synth(args):
     y = np.load(os.path.join(args.output_dir, "y_gf25.npy"))
     pool = X[y == 1].astype(np.float32)
     print(f"[synth] pool size (NoC=1): {pool.shape[0]}")
-    Xs, ys, mix, nall = synthesise(
+    os.makedirs(args.synth_dir, exist_ok=True)
+    synthesise(
         pool, n_samples=args.n, max_noc=args.max_noc,
         dirichlet_alpha=args.alpha,
         detection_threshold=args.threshold,
         height_jitter_sigma=args.jitter, rng_seed=args.seed,
+        out_dir=args.synth_dir,
     )
-    os.makedirs(args.synth_dir, exist_ok=True)
-    np.save(os.path.join(args.synth_dir, "X.npy"), Xs)
-    np.save(os.path.join(args.synth_dir, "y.npy"), ys)
-    np.save(os.path.join(args.synth_dir, "mix.npy"), mix)
-    np.save(os.path.join(args.synth_dir, "locus_nall.npy"), nall)
-    uniq, cnt = np.unique(ys, return_counts=True)
+    ys = np.load(os.path.join(args.synth_dir, "y.npy"), allow_pickle=True)
+    uniq, cnt = np.unique(np.asarray(ys), return_counts=True)
     print(f"[synth] wrote {args.n} profiles to {args.synth_dir}")
     print(f"[synth] NoC distribution: {dict(zip(uniq.tolist(), cnt.tolist()))}")
 
@@ -429,6 +431,8 @@ def main():
     p_prepare.add_argument('--kit', default='GF', help='Kit filter (GF=GlobalFiler)')
     p_prepare.add_argument('--injection', default='25sec', help='Injection time filter')
     p_prepare.add_argument('--instrument', default='3500', help='Instrument filter')
+    p_prepare.add_argument('--max-1person', type=int, default=None,
+                           help='Optional cap on NoC=1 profiles (default: keep all)')
     
     # Baseline command
     p_baseline = subparsers.add_parser('baseline', parents=[common],
@@ -455,7 +459,8 @@ def main():
     p_train.add_argument('--test-size', type=float, default=0.25)
     p_train.add_argument('--seed', type=int, default=42)
     # NoCFormer-only knobs
-    p_train.add_argument('--d-model', type=int, default=128)
+    p_train.add_argument('--d-model', type=int, default=96,
+                         help='Model dimension (96=574k params, 128=1.4M params)')
     p_train.add_argument('--n-heads', type=int, default=4)
     p_train.add_argument('--peak-layers', type=int, default=2)
     p_train.add_argument('--locus-layers', type=int, default=4)
@@ -479,6 +484,12 @@ def main():
                          help='Fraction of batch drawn from synthetic pool')
     p_train.add_argument('--samples-per-epoch', type=int, default=4000,
                          help='Hybrid loader iterations per epoch')
+    p_train.add_argument('--label-smoothing', type=float, default=0.1,
+                         help='NoCNet-v2 classifier label smoothing (0 disables)')
+    p_train.add_argument('--mixup-alpha', type=float, default=0.2,
+                         help='Beta(alpha,alpha) for MixUp; 0 disables')
+    p_train.add_argument('--mixup-prob', type=float, default=0.5,
+                         help='Per-batch probability to apply MixUp')
     
     # Synth command
     p_synth = subparsers.add_parser('synth', parents=[common],

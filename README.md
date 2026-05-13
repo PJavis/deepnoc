@@ -50,7 +50,7 @@ python main.py cv --models mac rf deepnoc_full nocformer nocnet_v2 \
 Trên GPU 16 GB tăng quy mô:
 
 ```bash
-python main.py synth --n 100000 --max-noc 5
+python main.py synth --n 30000 --max-noc 5
 python main.py train --model nocnet_v2 --epochs 150 --batch-size 64 \
     --samples-per-epoch 8000 --p-synth 0.85
 python main.py finetune --checkpoint results/best_nocnet_v2.pt --epochs 60
