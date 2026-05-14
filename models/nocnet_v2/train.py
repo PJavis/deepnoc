@@ -141,7 +141,9 @@ class SynthProfileDataset(Dataset):
 
     def __init__(self, synth_dir: str, augment: bool = True,
                  augment_cfg: dict | None = None):
-        self.X = np.load(os.path.join(synth_dir, "X.npy"), allow_pickle=True)
+        # X is the only large array (~12 GB for the full pool). Memmap it so
+        # the OS pages slices on demand; y/mix/nall are <2 MB → load eagerly.
+        self.X = np.load(os.path.join(synth_dir, "X.npy"), mmap_mode="r")
         self.y = np.load(os.path.join(synth_dir, "y.npy"), allow_pickle=True)
         self.mix = np.load(os.path.join(synth_dir, "mix.npy"), allow_pickle=True)
         self.nall = np.load(os.path.join(synth_dir, "locus_nall.npy"), allow_pickle=True)
