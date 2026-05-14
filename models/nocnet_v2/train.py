@@ -545,6 +545,8 @@ def finetune_nocnet_v2(
     swa_frac: float = 0.4,
     jitter_sigma: float = 0.05,
     dropout_p: float = 0.01,
+    synth_dir: Optional[str] = None,
+    p_synth: float = 0.0,
     save_dir: str = "results",
     tag: str = "nocnet_v2_ft",
     freeze_peak_stages: bool = False,
@@ -582,7 +584,7 @@ def finetune_nocnet_v2(
         epochs=epochs, batch_size=batch_size, lr=lr,
         weight_decay=weight_decay,
         warmup_epochs=max(1, epochs // 10),
-        p_synth=0.0,
+        p_synth=p_synth,
         samples_per_epoch=samples_per_epoch,
         d_model=model.d_model, n_heads=4,
         peak_layers=len(model.peak_blocks),
@@ -609,10 +611,25 @@ def finetune_nocnet_v2(
                      "dropout_p": cfg.dropout_p, "do_shuffle": True},
     )
     real_test = RealProfileDataset(X_test, y_test, augment=False)
-    sampler = MixedSampler(y_train, None, p_synth=0.0,
-                           n_per_epoch=cfg.samples_per_epoch, seed=cfg.seed)
-    train_loader = HybridLoader(real_train, None, sampler,
+
+    use_synth = (synth_dir is not None and p_synth > 0
+                 and os.path.exists(os.path.join(synth_dir, "X.npy")))
+    synth_train = (SynthProfileDataset(
+        synth_dir, augment=True,
+        augment_cfg={"jitter_sigma": cfg.jitter_sigma,
+                     "dropout_p": cfg.dropout_p, "do_shuffle": True},
+    ) if use_synth else None)
+
+    sampler = MixedSampler(
+        y_train,
+        synth_y=(synth_train.y if synth_train is not None else None),
+        p_synth=p_synth if use_synth else 0.0,
+        n_per_epoch=cfg.samples_per_epoch, seed=cfg.seed,
+    )
+    train_loader = HybridLoader(real_train, synth_train, sampler,
                                 batch_size=cfg.batch_size)
+    if verbose and use_synth:
+        print(f"[finetune] hybrid p_synth={p_synth} synth={synth_dir}")
     test_loader = DataLoader(real_test, batch_size=cfg.batch_size,
                              shuffle=False, num_workers=0)
 
@@ -685,11 +702,16 @@ def finetune_nocnet_v2(
         for batch in bar:
             x = batch["x"].to(device, non_blocking=True)
             y = batch["y"].to(device, non_blocking=True)
+            is_synth = batch["is_synth"].to(device, non_blocking=True)
+            mix = batch["mix"].to(device, non_blocking=True)
+            nall = batch["nall"].to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             out = model(x)
             losses = criterion(out, {
                 "profile_noc": y,
-                "is_synth": torch.zeros_like(y, dtype=torch.bool),
+                "is_synth": is_synth,
+                "profile_mix_props": mix,
+                "locus_n_alleles": nall,
             })
             loss = losses["total"]
             loss.backward()
@@ -811,3 +833,62 @@ def predict_nocnet_v2(model: NoCNetV2, X: np.ndarray, batch_size: int = 32,
     probs = np.concatenate(probs, axis=0)
     preds = probs.argmax(axis=1) + 1
     return probs, preds
+
+
+@torch.no_grad()
+def predict_nocnet_v2_tta(
+    model: NoCNetV2,
+    X: np.ndarray,
+    n_samples: int = 8,
+    batch_size: int = 32,
+    jitter_sigma: float = 0.08,
+    dropout_p: float = 0.0,
+    do_shuffle: bool = True,
+    use_mc_dropout: bool = False,
+    device: torch.device | None = None,
+    seed: int = 0,
+    verbose: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Test-time augmentation: run `n_samples` forward passes per profile, each
+    with a fresh peak shuffle + log-normal height jitter, then average the
+    softmax probabilities. Optional MC-Dropout enables dropout at test time
+    for additional epistemic uncertainty.
+
+    Returns:
+        probs:   [N, K] averaged class probabilities
+        preds:   [N]    argmax + 1
+        entropy: [N]    predictive entropy across the TTA samples
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    if use_mc_dropout:
+        model.train()
+    else:
+        model.eval()
+
+    rng = np.random.default_rng(seed)
+    N = X.shape[0]
+    K = model.num_classes
+    accum = np.zeros((N, K), dtype=np.float64)
+    aug_cfg = {"jitter_sigma": jitter_sigma, "dropout_p": dropout_p,
+               "do_shuffle": do_shuffle}
+    desc = f"tta ({n_samples}x)"
+    sample_iter = tqdm(range(n_samples), desc=desc, disable=not verbose)
+    for s in sample_iter:
+        s_rng = np.random.default_rng(seed * 1000 + s)
+        x_aug = np.empty_like(X, dtype=np.float32)
+        for i in range(N):
+            x_aug[i] = augment_profile(X[i].astype(np.float32),
+                                       rng=s_rng, **aug_cfg)
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            xb = torch.from_numpy(x_aug[start:end]).to(device)
+            out = model(xb)
+            accum[start:end] += out["profile_noc_probs"].cpu().numpy()
+    probs = accum / n_samples
+    preds = probs.argmax(axis=1) + 1
+    eps = 1e-12
+    entropy = -(probs * np.log(probs + eps)).sum(axis=1)
+    model.eval()
+    return probs, preds, entropy

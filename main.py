@@ -142,7 +142,8 @@ def cmd_train(args):
 
     if args.model == "nocnet_v2":
         from models.nocnet_v2.train import (
-            train_nocnet_v2, predict_nocnet_v2, TrainConfig,
+            train_nocnet_v2, predict_nocnet_v2, predict_nocnet_v2_tta,
+            TrainConfig,
         )
         cfg = TrainConfig(
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
@@ -167,9 +168,17 @@ def cmd_train(args):
             save_path=os.path.join(args.results_dir, "training_history_nocnet_v2.png"),
         )
         print("\n--- Final Evaluation on Test Set ---")
-        probs, preds = predict_nocnet_v2(model, X_test,
-                                         batch_size=args.batch_size,
-                                         device=device)
+        if args.tta:
+            probs, preds, entropy = predict_nocnet_v2_tta(
+                model, X_test, n_samples=args.tta_samples,
+                batch_size=args.batch_size, device=device, verbose=True,
+            )
+            np.save(os.path.join(args.results_dir, "nocnet_v2_tta_entropy.npy"),
+                    entropy)
+        else:
+            probs, preds = predict_nocnet_v2(model, X_test,
+                                             batch_size=args.batch_size,
+                                             device=device)
         labels = sorted(set(y_test))
         full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
                         title="NoCNet-v2", save_dir=args.results_dir)
@@ -293,6 +302,88 @@ def cmd_cv(args):
     )
 
 
+def cmd_ensemble(args):
+    """Train N seeds and ensemble their probabilities."""
+    from src.ensemble import run_ensemble, _load_data
+    X, y, names = _load_data(args.output_dir)
+    print(f"Loaded X={X.shape} y={y.shape} names={len(names)}")
+    run_ensemble(
+        X, y, names,
+        n_seeds=args.n_seeds, base_seed=args.seed,
+        split=args.split, test_size=args.test_size,
+        synth_dir=args.synth_dir,
+        pretrain_epochs=args.pretrain_epochs,
+        finetune_epochs=args.finetune_epochs,
+        finetune_lr=args.finetune_lr,
+        finetune_p_synth=args.finetune_p_synth,
+        batch_size=args.batch_size, lr=args.lr,
+        p_synth=args.p_synth, d_model=args.d_model,
+        samples_per_epoch=args.samples_per_epoch,
+        save_dir=args.save_dir,
+        tta_samples=args.tta_samples,
+    )
+
+
+def cmd_tune(args):
+    """Tune per-class additive bias on val split to maximize macro-F1."""
+    import json
+    from src.threshold_tune import tune_thresholds
+    from models.nocnet_v2.train import (
+        load_nocnet_v2, predict_nocnet_v2, predict_nocnet_v2_tta,
+    )
+
+    X, y = load_data(args)
+    names = _load_names(args) or [str(i) for i in range(len(y))]
+    if len(names) != len(y):
+        names = [str(i) for i in range(len(y))]
+    _, X_te, _, y_te, _, _ = _split(X, y, names, args)
+
+    rng = np.random.default_rng(args.seed)
+    perm = rng.permutation(len(y_te))
+    n_val = int(len(y_te) * args.val_frac)
+    val_idx, test_idx = perm[:n_val], perm[n_val:]
+    X_val, y_val = X_te[val_idx], y_te[val_idx]
+    X_holdout, y_holdout = X_te[test_idx], y_te[test_idx]
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = load_nocnet_v2(args.checkpoint, device=device)
+
+    if args.tta:
+        probs_val, _, _ = predict_nocnet_v2_tta(
+            model, X_val, n_samples=args.tta_samples, device=device,
+            batch_size=args.batch_size)
+        probs_test, _, _ = predict_nocnet_v2_tta(
+            model, X_holdout, n_samples=args.tta_samples, device=device,
+            batch_size=args.batch_size)
+    else:
+        probs_val, _ = predict_nocnet_v2(model, X_val, device=device,
+                                         batch_size=args.batch_size)
+        probs_test, _ = predict_nocnet_v2(model, X_holdout, device=device,
+                                          batch_size=args.batch_size)
+
+    out = tune_thresholds(probs_val, y_val, probs_test, y_holdout,
+                          metric=args.metric, verbose=True)
+    out["split"] = getattr(args, "split", "grouped")
+    out["val_size"] = int(len(y_val))
+    out["test_size"] = int(len(y_holdout))
+    out["checkpoint"] = args.checkpoint
+    out["tta"] = bool(args.tta)
+    out_path = os.path.join(args.results_dir, args.out_name)
+    os.makedirs(args.results_dir, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print("\n" + "=" * 60)
+    print(f"  Threshold tuning summary -> {out_path}")
+    print("=" * 60)
+    for k in ("val_metric_before", "val_metric_after",
+              "val_acc_before", "val_acc_after",
+              "test_metric_before", "test_metric_after",
+              "test_acc_before", "test_acc_after"):
+        if k in out:
+            print(f"  {k:22s} {out[k]:.4f}")
+    print(f"  bias = {np.round(np.array(out['bias']), 3).tolist()}")
+
+
 def cmd_finetune(args):
     """Fine-tune a NoCNet-v2 synthetic-pretrained checkpoint on real PROVEDIt."""
     from models.nocnet_v2.train import finetune_nocnet_v2
@@ -317,6 +408,8 @@ def cmd_finetune(args):
         swa_frac=args.swa_frac,
         jitter_sigma=args.jitter_sigma,
         dropout_p=args.dropout_p,
+        synth_dir=(None if args.no_synth else args.synth_dir),
+        p_synth=args.p_synth,
         save_dir=args.results_dir,
         tag=args.tag,
         freeze_peak_stages=args.freeze_peak,
@@ -327,9 +420,18 @@ def cmd_finetune(args):
         save_path=os.path.join(args.results_dir,
                                f"training_history_{args.tag}.png"),
     )
-    probs, preds = predict_nocnet_v2(model, X_test,
-                                     batch_size=args.batch_size,
-                                     device=device)
+    if args.tta:
+        from models.nocnet_v2.train import predict_nocnet_v2_tta
+        probs, preds, entropy = predict_nocnet_v2_tta(
+            model, X_test, n_samples=args.tta_samples,
+            batch_size=args.batch_size, device=device, verbose=True,
+        )
+        np.save(os.path.join(args.results_dir,
+                             f"{args.tag}_tta_entropy.npy"), entropy)
+    else:
+        probs, preds = predict_nocnet_v2(model, X_test,
+                                         batch_size=args.batch_size,
+                                         device=device)
     labels = sorted(set(y_test))
     full_evaluation(y_test, preds, y_probs=probs, class_labels=labels,
                     title=f"NoCNet-v2_{args.tag}", save_dir=args.results_dir)
@@ -484,6 +586,8 @@ def main():
                          help='Fraction of batch drawn from synthetic pool')
     p_train.add_argument('--samples-per-epoch', type=int, default=4000,
                          help='Hybrid loader iterations per epoch')
+    p_train.add_argument('--tta', action='store_true',
+                         help='Use TTA at final evaluation (NoCNet-v2 only)')
     p_train.add_argument('--label-smoothing', type=float, default=0.1,
                          help='NoCNet-v2 classifier label smoothing (0 disables)')
     p_train.add_argument('--mixup-alpha', type=float, default=0.2,
@@ -517,6 +621,46 @@ def main():
     p_cv.add_argument('--lr', type=float, default=3e-4)
     p_cv.add_argument('--seed', type=int, default=42)
 
+    # Ensemble command — N-seed pretrain+finetune ensemble
+    p_ens = subparsers.add_parser('ensemble', parents=[common],
+                                  help='Train N seeds and ensemble probs')
+    p_ens.add_argument('--save-dir', default='results/ensemble')
+    p_ens.add_argument('--synth-dir', default='data/synthetic')
+    p_ens.add_argument('--n-seeds', type=int, default=5)
+    p_ens.add_argument('--seed', type=int, default=42,
+                       help='Base seed; seeds = base, base+1, ...')
+    p_ens.add_argument('--split', choices=['alternating', 'stratified', 'grouped'],
+                       default='grouped')
+    p_ens.add_argument('--test-size', type=float, default=0.25)
+    p_ens.add_argument('--pretrain-epochs', type=int, default=100)
+    p_ens.add_argument('--finetune-epochs', type=int, default=40)
+    p_ens.add_argument('--finetune-lr', type=float, default=1e-5)
+    p_ens.add_argument('--finetune-p-synth', type=float, default=0.2)
+    p_ens.add_argument('--batch-size', type=int, default=16)
+    p_ens.add_argument('--lr', type=float, default=3e-4)
+    p_ens.add_argument('--p-synth', type=float, default=0.85)
+    p_ens.add_argument('--d-model', type=int, default=96)
+    p_ens.add_argument('--samples-per-epoch', type=int, default=4000)
+    p_ens.add_argument('--tta-samples', type=int, default=0,
+                       help='If >0, use TTA at per-seed inference')
+
+    # Tune command — per-class threshold bias tuning
+    p_tune = subparsers.add_parser('tune', parents=[common],
+                                   help='Per-class threshold tuning (macro-F1)')
+    p_tune.add_argument('--checkpoint', required=True)
+    p_tune.add_argument('--val-frac', type=float, default=0.5,
+                        help='Fraction of grouped test split used as validation')
+    p_tune.add_argument('--metric', choices=['macro_f1', 'accuracy'],
+                        default='macro_f1')
+    p_tune.add_argument('--tta', action='store_true')
+    p_tune.add_argument('--tta-samples', type=int, default=8)
+    p_tune.add_argument('--batch-size', type=int, default=32)
+    p_tune.add_argument('--split', choices=['alternating', 'stratified', 'grouped'],
+                        default='grouped')
+    p_tune.add_argument('--test-size', type=float, default=0.25)
+    p_tune.add_argument('--seed', type=int, default=42)
+    p_tune.add_argument('--out-name', default='threshold_tuning.json')
+
     # Finetune command
     p_ft = subparsers.add_parser('finetune', parents=[common],
                                  help='Fine-tune NoCNet-v2 on real PROVEDIt')
@@ -532,6 +676,16 @@ def main():
     p_ft.add_argument('--dropout-p', type=float, default=0.01)
     p_ft.add_argument('--freeze-peak', action='store_true',
                       help='Freeze peak stages, only fine-tune cross-locus + heads')
+    p_ft.add_argument('--synth-dir', default='data/synthetic',
+                      help='Path to synthetic pool (used when --p-synth > 0)')
+    p_ft.add_argument('--no-synth', action='store_true',
+                      help='Force real-only finetune even if synth available')
+    p_ft.add_argument('--p-synth', type=float, default=0.0,
+                      help='Fraction of batch from synth pool (0.0 = real only, '
+                           '0.2 typically retains pretrain signal on minority classes)')
+    p_ft.add_argument('--tta', action='store_true',
+                      help='Use TTA at final evaluation')
+    p_ft.add_argument('--tta-samples', type=int, default=8)
     p_ft.add_argument('--tag', default='nocnet_v2_ft')
     p_ft.add_argument('--split', choices=['alternating', 'stratified', 'grouped'],
                       default='grouped')
@@ -574,6 +728,8 @@ def main():
         'synth': cmd_synth,
         'cv': cmd_cv,
         'finetune': cmd_finetune,
+        'tune': cmd_tune,
+        'ensemble': cmd_ensemble,
     }
     
     commands[args.command](args)
