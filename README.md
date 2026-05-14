@@ -572,6 +572,10 @@ Trong `results/`, repo hiện sinh ra các file như:
 - `checkpoint_*_ep*.pt`
 - `history_*.json` (bao gồm `swa_test_acc` cho NoCNet-v2)
 
+## Report
+- `report/build_report.py` tạo báo cáo NoCFormer.
+- `report/build_nocnet_v2_report.py` tạo báo cáo cho NoCNet-v2 mới.
+
 CV runner thêm:
 
 - `results/cv/<model>/fold<k>/metrics.json`
