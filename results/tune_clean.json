@@ -1,0 +1,23 @@
+{
+  "bias": [
+    1.6000000000000005,
+    0.0,
+    -0.5999999999999996,
+    0.0,
+    2.6000000000000005
+  ],
+  "metric": "macro_f1",
+  "val_metric_before": 0.5629113171372967,
+  "val_metric_after": 0.7188656972522913,
+  "val_acc_before": 0.8676789587852495,
+  "val_acc_after": 0.9370932754880694,
+  "test_metric_before": 0.6071441253507162,
+  "test_metric_after": 0.5663326400107768,
+  "test_acc_before": 0.8917748917748918,
+  "test_acc_after": 0.9177489177489178,
+  "split": "grouped",
+  "val_size": 461,
+  "test_size": 462,
+  "checkpoint": "results/best_nocnet_v2_ft.pt",
+  "tta": true
+}

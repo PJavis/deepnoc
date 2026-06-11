@@ -383,12 +383,44 @@ def main():
     ap.add_argument("--jitter", type=float, default=0.08,
                     help="Per-peak log-normal height jitter sigma")
     ap.add_argument("--seed", type=int, default=0)
+    # Leakage guard: drop test-split profiles from the NoC=1 pool so the
+    # synthetic pretrain set never contains peaks from held-out test profiles.
+    ap.add_argument("--exclude-test", action="store_true",
+                    help="Build pool from TRAIN split only (needs --names)")
+    ap.add_argument("--names", default="data/provedit_processed/sample_names.txt",
+                    help="sample_names.txt, used by --exclude-test for the split")
+    ap.add_argument("--split", default="grouped",
+                    choices=["grouped", "stratified", "alternating"])
+    ap.add_argument("--test-size", type=float, default=0.25)
+    ap.add_argument("--split-seed", type=int, default=42,
+                    help="Seed for the train/test split (must match training)")
     args = ap.parse_args()
 
     print(f"[synth] loading {args.source}")
     X = np.load(args.source)
     y = np.load(args.labels)
-    pool = X[y == 1].astype(np.float32)
+
+    if args.exclude_test:
+        with open(args.names) as f:
+            names = [ln.rstrip("\n") for ln in f if ln.strip()]
+        if len(names) != len(y):
+            names = [str(i) for i in range(len(y))]
+        if args.split == "grouped":
+            from src.split import grouped_stratified_split
+            Xtr, _, ytr, _, _, _ = grouped_stratified_split(
+                X, y, names, test_size=args.test_size, seed=args.split_seed)
+        elif args.split == "stratified":
+            from src.split import stratified_split
+            Xtr, _, ytr, _, _, _ = stratified_split(
+                X, y, names, test_size=args.test_size, seed=args.split_seed)
+        else:
+            from src.data_loader import train_test_split_alternating
+            Xtr, _, ytr, _, _, _ = train_test_split_alternating(X, y, names)
+        pool = Xtr[ytr == 1].astype(np.float32)
+        print(f"[synth] EXCLUDE-TEST: pool from TRAIN split only "
+              f"({args.split}, seed={args.split_seed}, test_size={args.test_size})")
+    else:
+        pool = X[y == 1].astype(np.float32)
     print(f"[synth] NoC=1 pool: {pool.shape[0]} profiles")
 
     os.makedirs(args.out_dir, exist_ok=True)

@@ -9,3 +9,12 @@ wheels/
 # Virtual environments
 .venv
 /data
+# Large external-delivery bundle (ship via zip/drive, not git)
+/deliverable/
+/deliverable.zip
+
+# Leaky-run checkpoints kept on disk for reference only (superseded by clean run)
+results/*_LEAKY.pt
+
+# Synthetic pools (regenerable via src/synth.py)
+/data/synthetic_clean/
