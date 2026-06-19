@@ -1,0 +1,58 @@
+<mxfile host="app.diagrams.net" type="device">
+  <diagram name="NoCNetV2" id="nocnet-arch-1">
+    <mxGraphModel dx="900" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="t" value="Kiến trúc tổng thể NoCNet-v2 (Deep Sets) — ~0,8M tham số&#10;d_model=96 · 4 đầu chú ý · K=5 lớp NoC" style="text;html=1;align=center;fontSize=13;fontStyle=1;fontColor=#1F4E79;" vertex="1" parent="1">
+          <mxGeometry x="160" y="20" width="540" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="n0" value="Đầu vào: tensor (B, 24, 50, 89)&#10;24 locus × ≤50 đỉnh × 89 đặc trưng/đỉnh" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEEEEE;strokeColor=#1F4E79;" vertex="1" parent="1">
+          <mxGeometry x="270" y="80" width="320" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="n1" value="(1) PeakEmbedder&#10;MLP 89→96 (2× GELU+LayerNorm+Dropout) → (B,24,50,96)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBE7F3;strokeColor=#1F4E79;" vertex="1" parent="1">
+          <mxGeometry x="250" y="166" width="360" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="n2" value="(2) 2× LocusEncoderBlock (per-locus)&#10;StutterBiasAttention (bias theo Δ allele) + FFN, pre-LN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBE7F3;strokeColor=#1F4E79;" vertex="1" parent="1">
+          <mxGeometry x="250" y="256" width="360" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="n3" value="(3) DeepSetsPool (gộp đỉnh→locus)&#10;ρ([sum, max, log1p(count)]) — bất biến hoán vị, giữ ĐẾM → (B,24,96)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBE7F3;strokeColor=#1F4E79;" vertex="1" parent="1">
+          <mxGeometry x="250" y="350" width="360" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="n4" value="(4) 2× CrossLocusTransformer&#10;MHA + FFN trên 24 token locus + dye_emb(5) + pos_emb → (B,24,96)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DBE7F3;strokeColor=#1F4E79;" vertex="1" parent="1">
+          <mxGeometry x="250" y="444" width="360" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="n5" value="(5) ProfilePool&#10;gộp [sum, mean, max] theo 24 locus → profile (B,96)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E3F1E1;strokeColor=#2E7D32;" vertex="1" parent="1">
+          <mxGeometry x="270" y="538" width="320" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="n6" value="(6) CountAwareHead — 3 góc nhìn NoC&#10;cls softmax (CE) · reg vô hướng (smooth-L1) · corn ordinal (BCE)&#10;→ ensemble probs (B,5) + mix_props (B,10)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0D6;strokeColor=#E07B00;" vertex="1" parent="1">
+          <mxGeometry x="250" y="624" width="360" height="74" as="geometry" />
+        </mxCell>
+        <mxCell id="naux" value="Đầu phụ (train)&#10;locus_n_alleles (B,24,20), CE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F3F3F3;strokeColor=#999999;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="640" y="354" width="180" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="np" value="Hậu xử lý suy luận&#10;TTA 20× MC-dropout + jitter → avg softmax&#10;+ bias theo lớp [1.6, 0, −0.6, 0, 2.6] → argmax" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F6E1EF;strokeColor=#8E2A73;" vertex="1" parent="1">
+          <mxGeometry x="250" y="728" width="360" height="64" as="geometry" />
+        </mxCell>
+        <mxCell id="nout" value="Đầu ra: NoC ∈ {1..5}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EEEEEE;strokeColor=#1F4E79;" vertex="1" parent="1">
+          <mxGeometry x="320" y="822" width="220" height="44" as="geometry" />
+        </mxCell>
+        <mxCell id="nloss" value="Mất mát đa nhiệm: CE(cls) + smooth-L1(reg) + BCE(corn) + phụ; trọng số lớp cân bằng β=0,999. Huấn luyện: tiền huấn luyện synthetic (p_synth=0,8) → tinh chỉnh PROVEDIt thật + SWA" style="text;html=1;align=center;fontSize=10;fontColor=#1F4E79;fillColor=#FBFBE7;strokeColor=#CACA7A;rounded=1;" vertex="1" parent="1">
+          <mxGeometry x="170" y="892" width="520" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e0" style="endArrow=block;html=1;" edge="1" parent="1" source="n0" target="n1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e1" style="endArrow=block;html=1;" edge="1" parent="1" source="n1" target="n2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e2" style="endArrow=block;html=1;" edge="1" parent="1" source="n2" target="n3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e3" style="endArrow=block;html=1;" edge="1" parent="1" source="n3" target="n4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e4" style="endArrow=block;html=1;" edge="1" parent="1" source="n4" target="n5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e5" style="endArrow=block;html=1;" edge="1" parent="1" source="n5" target="n6"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e6" style="endArrow=block;html=1;" edge="1" parent="1" source="n6" target="np"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e7" style="endArrow=block;html=1;" edge="1" parent="1" source="np" target="nout"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e8" value="aux" style="endArrow=block;html=1;dashed=1;" edge="1" parent="1" source="n3" target="naux"><mxGeometry relative="1" as="geometry" /></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
